@@ -1,0 +1,807 @@
+---
+title: "FARMM metagenomic analysis"
+author: "PennCHOP Microbiome Program"
+date: \today
+output: 
+  pdf_document:
+    toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  tidy=FALSE,
+  cache=FALSE,
+  echo=FALSE,
+  warning=FALSE,
+  message=FALSE,
+  dpi=100,
+  fig.width=6,
+  fig.height=4,
+  fig.align = "center"
+  )
+```
+
+```{r child = 'farmm_preamble.Rmd'}
+```
+
+# Introduction
+
+FARMM study
+
+Shotgun metagenomic sequencing of fecal samples from 30 healthy human subjects at various timepoints (4 total) with defined diets.
+
+
+The reads from the study have been aligned against the KEGG database and the relative abundance of each ortholog have been calculated. Databases for bai and bsh genes have been curated from NCBI search. The butyrate genes have been obtained from the IMG database based on the IDs curated in the Vital et al (2014) paper.
+
+```{r}
+s_toTest <- s %>%
+  filter(Keep) %>%
+  filter(!isControl) %>%
+  filter(project == "FARMM") %>%
+  mutate(study_day = as.numeric(as.character(study_day))) %>%
+  droplevels()
+```
+
+
+```{r}
+# load metabolite results
+metabolite_fp <- file.path(data_dir, "farmm_metabolite.txt")
+metabolites <- read.delim(metabolite_fp) %>%
+  left_join(select(s_toTest, SubjectID, Age, BMI) %>% unique(), by="SubjectID") %>%
+  mutate(study_group = factor(study_group, levels=c("Omnivore", "Vegan", "EEN")))
+
+s_meta <- metabolites %>%
+  filter(!grepl("QQL|QPP|QPS|QCPP|QCPS", SampleID)) %>%
+  select(SampleID, SubjectID, study_group, study_day, SampleType, Age, BMI) %>%
+  unique() %>%
+  mutate(SampleID = as.character(SampleID), SubjectID = as.character(SubjectID)) %>%
+  droplevels()
+```
+
+
+# Figure S1A: Sample collection
+
+```{r}
+bind_rows(
+  select(s_meta, SubjectID, study_day, study_group, SampleType) %>% mutate(platform = "Metabolomics"),
+  select(s_toTest, SubjectID, study_day, study_group, SampleType) %>% mutate(platform = "Shotgun sequencing")
+) %>%
+  mutate(platform = fct_rev(factor(platform))) %>%
+  mutate(study_day = factor(study_day)) %>%
+  mutate(collected = "yes") %>%
+  #complete(study_day, nesting(study_group, platform, SampleType), fill = list(collected="no")) %>%
+  ggplot(aes(x=study_day, y=SubjectID, fill=collected)) +
+    geom_tile() +
+    facet_grid(study_group ~ platform + SampleType, space="free", scales="free") +
+    theme_bw() +
+    scale_fill_manual(values="#5B1A18", na.value="#F1BB7B") +
+    theme(
+      #panel.background=element_rect(fill="#F1BB7B", colour="#F1BB7B"),
+      panel.grid = element_blank(),
+      strip.background = element_blank(),
+      aspect.ratio = 1
+    ) +
+    guides(fill=F) +
+    labs(
+      x="Study day",
+      y="Subject ID"
+    )
+ggsave("FigS1A_farmm_sampleCollection.pdf", height=6, width=6, useDingbats=F)
+```
+
+
+
+# Figure 3: Glycoside hydrolases from KEGG Orthology assignments
+
+Please see the attached figure GH_enzymes.pdf, farmm_heatmap_GH_unclustered.pdf and farmm_heatmap_GH_averaged_unclustered.pdf.
+
+```{r eval=T}
+library(stringr)
+#read_ko_table <- function (filepath, sample_prefix="PCMP_") {
+#  ko <- as.matrix(read.delim(filepath, row.names=1))
+#  colnames(ko) <- sub(sample_prefix, "", colnames(ko), fixed = TRUE)
+#  ko
+#}
+
+ko <- read.delim(ko_fp)
+
+ko_props <- sweep(ko, 2, colSums(ko), "/")
+
+
+GH_enzymes <- rownames(ko)[grepl("EC:3\\.2\\.1\\.", rownames(ko))]
+GH_enzymes_parsed <- as.data.frame(str_match(GH_enzymes, '^(K\\d{5}) (.*)? \\[(.*)?\\]$')) %>%
+  setNames(c("full_name", "KO", "gene_name", "EC"))
+
+#GH_enzymes_common <- rownames(ko)[grepl("EC:3\\.2\\.1\\.", rownames(ko)) & filter_low_coverage(ko, 0.8)]
+#ko_rarefied_GH <- ko_rarefied[GH_enzymes,]
+ko_props_GH <- ko_props[GH_enzymes,]
+
+# combine the terms based on the EC number
+#ko_rarefied_GH <- rowsum(ko_rarefied_GH, GH_enzymes_parsed$EC)
+ko_props_GH <- rowsum(ko_props_GH, GH_enzymes_parsed$EC)
+
+
+GH_enzymes_parsed_names <- GH_enzymes_parsed %>%
+  group_by(EC) %>%
+  slice(1) %>%
+  select(EC, gene_name) %>%
+  mutate(gene_name = ifelse(EC == "EC:3.2.1.17", "lysozyme", as.character(gene_name))) %>%
+  mutate(gene_name = ifelse(EC == "EC:3.2.1.-", "uncategorized glycoside hydrolase", as.character(gene_name)))
+
+```
+
+
+
+
+Linear mixed effects model on the logit transformed relative abundance of BSH genes. Mulyiple tests have been adjusted for false discovery rate using Benjamini-Hochberg method. The pre, during and post antibiotics time points have been tested for separately. 
+
+```{r}
+form1 <- "props_logit ~ BMI + Age + study_group * study_day"
+summaries_df <- ko_props_GH[filter_low_coverage(ko_props_GH, 0.8),s_toPlot$SampleID] %>%
+  melt() %>%
+  setNames(c("gene", "SampleID", "Proportion")) %>%
+  merge(s_toTest, by="SampleID") %>%
+  mutate(Proportion = Proportion + 1e-8) %>%
+  mutate(props_logit = log(Proportion/(1-Proportion))) %>%
+  group_by(gene, current_antibiotics) %>%
+  do(tidy_lmer(nlme::lme(as.formula(form1), random = ~ 1 | SubjectID, data=., na.action=na.omit))) %>%
+  ungroup() %>%
+  filter(term != '(Intercept)') %>%
+  #group_by(term) %>%
+  mutate(fdr = p.adjust(p.value, method="BH")) %>%
+  #ungroup() %>%
+  filter(p.value<0.05) %>%
+  mutate(term = sub("study_group", "Omnivore - ", term))
+
+summaries_df %>%
+  filter(fdr < 0.05) %>%
+  pander(split.table=Inf, digits=2)
+```
+
+```{r}
+GH_modulen_sumary <- summaries_df %>%
+  filter(fdr < 0.05) %>%
+  filter(term == "Omnivore - EEN:study_day") %>%
+  filter(current_antibiotics != "Antibiotics Treatment") %>%
+  mutate(current_antibiotics = sub(" Antibiotics", "", current_antibiotics)) %>%
+  mutate(isIncreasing = ifelse(Value>0, "up", "down")) %>%
+  mutate(label = paste(current_antibiotics, isIncreasing, sep="_")) %>%
+  select(gene, current_antibiotics, label) %>%
+  spread(current_antibiotics, label) %>%
+  mutate(label = paste(Pre, Post, sep="_")) %>%
+  mutate(label = factor(label, levels=c("Pre_down_NA", "Pre_down_Post_down", "NA_Post_down", "Pre_up_Post_up", "NA_Post_up"))) %>%
+  arrange(label)
+
+GH_annotations <- read.delim("farmm_data/specialized_databases/GH_annotations.txt")
+
+GH_order <- c("EC:3.2.1.20", "EC:3.2.1.41","EC:3.2.1.135","EC:3.2.1.78","EC:3.2.1.25", "EC:3.2.1.65",
+              "EC:3.2.1.8","EC:3.2.1.37","EC:3.2.1.55","EC:3.2.1.139",
+              "EC:3.2.1.67","EC:3.2.1.99","EC:3.2.1.89",
+              "EC:3.2.1.51","EC:3.2.1.31",
+              "EC:3.2.1.45","EC:3.2.1.52",
+              
+              "EC:3.2.1.93", "EC:3.2.1.26", "EC:3.2.1.85", "EC:3.2.1.86", "EC:3.2.1.1",
+              "EC:3.2.1.96", "EC:3.2.1.14", "EC:3.2.1.17")
+
+#setdiff(summaries_df %>% filter(fdr < 0.05) %>% filter(current_antibiotics != "Antibiotics Treatment") %>% filter(term == "Western - EEN:study_day") %>% droplevels() %>% pull(gene) %>% unique() %>% levels(), GH_order)
+#setdiff(GH_order, summaries_df %>% filter(fdr < 0.05) %>% filter(current_antibiotics != "Antibiotics Treatment") %>% filter(term == "Western - EEN:study_day") %>% droplevels() %>% pull(gene) %>% unique() %>% levels())
+```
+
+```{r warning=F, fig.height=8, fig.width=13}
+# heatmap with averages
+s_toPlot <- s %>%
+  filter(Keep) %>%
+  filter(current_antibiotics != "Antibiotics Treatment")
+
+props_toPlot <- ko_props_GH[GH_order,s_toPlot$SampleID]
+props_toPlot <- props_toPlot %>%
+  melt() %>%
+  setNames(c("GH", "SampleID", "props")) %>%
+  merge(s_toPlot, by="SampleID") %>%
+  merge(GH_enzymes_parsed_names, by.x="GH", by.y="EC") %>%
+  mutate(GH_full = paste(GH, gene_name)) %>%
+  group_by(study_group, study_day, current_antibiotics, GH, GH_full) %>%
+  summarize(mean_prop = mean(props)) %>%
+  ungroup() %>%
+  mutate(GH_full = factor(GH_full, levels=unique(.$GH_full))) %>%
+  select(-GH) %>%
+  spread(GH_full, mean_prop) %>%
+  mutate(SampleID = paste(study_group, study_day, sep="_"))
+
+s_toPlot_temp <- select(props_toPlot, SampleID, study_group, study_day, current_antibiotics)
+props_toPlot <- select(props_toPlot, -one_of("SampleID", "study_group", "study_day", "current_antibiotics"))
+props_toPlot <- as.matrix(props_toPlot)
+rownames(props_toPlot) <- s_toPlot_temp$SampleID
+
+props_toPlot <- t(scale(props_toPlot))
+
+
+annotations <- s_toPlot_temp %>%
+  arrange(current_antibiotics, study_group, study_day)
+rownames(annotations) = annotations$SampleID
+annotations <- select(annotations, -SampleID)
+annotations <- as.data.frame(annotations)
+
+
+annotations_row <- GH_modulen_sumary %>%
+  merge(GH_annotations, by.x="gene", by.y="Enzyme") %>%
+  mutate(GH_full = paste(gene, Enzyme_name)) %>%
+  select(GH_full,category=Polymer_broad_category, Pre, Post) %>%
+  mutate(Pre=factor(Pre), Post=factor(Post), category=factor(category)) 
+  
+rownames(annotations_row) = annotations_row$GH_full
+annotations_row <- select(annotations_row, -GH_full)
+annotations_row <- as.data.frame(annotations_row)  
+
+gaps <- annotations %>%
+  mutate(label = interaction(study_group, current_antibiotics)) %>%
+  group_by(label) %>%
+  summarize(nums = n()) %>%
+  ungroup() %>%
+  pull(nums) %>%
+  cumsum()
+
+ann_colors <- list(
+  Pre = setNames(c("#000000", "#000000"), levels(annotations_row$Pre)),
+  Post = setNames(c("#000000", "#000000"), levels(annotations_row$Post)),
+  category=setNames(brewer.pal(6, 'Set2'), levels(annotations_row$category))
+)
+
+cols <- rev(brewer.pal(11, 'RdBu'))
+pheatmap(props_toPlot[,rownames(annotations)], 
+         annotation_col = annotations, 
+         annotation_row = annotations_row,
+         annotation_colors = ann_colors,
+         color=colorRampPalette(cols)(107),
+         breaks = c(-5, -4, -3, seq(-2, 2, length.out = 100),3, 4,5), 
+         filename = "farmm_heatmap_GH_averaged_unclustered_Zscores.pdf", 
+         gaps_col=gaps,
+         gaps_row=c(17),
+         height=7,
+         fontsize_col = 8, fontsize_row = 8, 
+         cluster_cols = FALSE, cluster_rows = FALSE,
+         cellheight = 8, cellwidth = 8)
+```
+
+
+
+# Figure 4: Alignment to butyrate producing genes
+
+Protein sequences of butyrate producing genes have been obtained from the IMG database. The IMG ids of the genes have been obtained from the Vital et al (2014) paper. The reads were aligned to the gene sequences using diamond search. The alignments that are <30 amino acids were removed. Also for each sequence, the hits with more than 3 mismatch differene compared to the best hit were removed. If multiple genes aligned well to a sequence, the gene with the higher bit score and the one that had more number of hits has been selected.
+
+```{r}
+but_props <- read.delim(file.path(data_dir, "farmm_but_hits.txt")) %>%
+  mutate(SubjectID = as.character(SubjectID)) %>%
+  mutate(SampleID = as.character(SampleID)) %>%
+  mutate(study_group = factor(study_group, levels=levels(s_toTest$study_group))) %>%
+  filter(SampleID %in% s_toTest$SampleID) %>%
+  mutate(study_day = as.numeric(as.character(study_day))) %>%
+  mutate(current_antibiotics = factor(current_antibiotics, levels=levels(s_toTest$current_antibiotics))) %>%
+  droplevels()
+
+#write.table(but_props, file="but_props.txt", quote=F, row.names=F, sep='\t')  
+```
+
+
+
+Individual fits
+
+```{r}
+form1 <- "props_logit ~ BMI + Age + study_day"
+summaries_df <- but_props %>%
+  mutate(props_logit = log(Proportion/(1-Proportion))) %>%
+  group_by(gene, study_group, current_antibiotics) %>%
+  do(tidy_lmer(nlme::lme(as.formula(form1), random = ~ 1 | SubjectID, data=., na.action=na.omit))) %>%
+  ungroup() %>%
+  filter(term != '(Intercept)') %>%
+  group_by(term) %>%
+  mutate(fdr = p.adjust(p.value, method="BH")) %>%
+  ungroup() %>%
+  #filter(p.value<0.05) %>%
+  mutate(term = sub("study_group", "Western - ", term))
+
+summaries_df %>%
+  mutate(annotation = gtools:::stars.pval(fdr)) %>%
+  write.table(file="farmm_butyrate_individualSlopes.txt", sep='\t', quote=F, row.names=F)
+```
+
+```{r}
+palette <- colorRampPalette(brewer.pal(11, "RdBu"))
+summaries_df %>%
+  mutate(current_antibiotics = fct_recode(current_antibiotics, D="Pre Antibiotics", A="Antibiotics Treatment", R="Post Antibiotics")) %>%
+  mutate(study_group = fct_recode(study_group, O="Omnivore", V="Vegan", E="EEN")) %>%
+  mutate(study_group = fct_rev(study_group)) %>%
+  filter(current_antibiotics != "A") %>%
+  ggplot(aes(x=current_antibiotics, y=study_group, fill=Value)) +
+    geom_tile() +
+    facet_wrap(~gene) +
+    scale_fill_gradient2(low="#053061", mid="#F7F7F7", high="#67001F", midpoint=0) +
+    coord_equal() +
+    theme(
+      strip.background = element_blank(),
+      panel.grid = element_blank()
+    )
+ggsave("Fig4_farmm_butyrate_slopes.pdf", width=6, height=6, useDingbats=F)
+```
+
+
+
+Linear mixed effects model on the logit transformed relative abundance of butyrate producing genes. Mulyiple tests have been adjusted for false discovery rate using Benjamini-Hochberg method. The pre, during and post antibiotics time points have been tested for separately. 
+
+
+```{r}
+form1 <- "props_logit ~ BMI + Age + study_group * study_day"
+summaries_df <- but_props %>%
+  mutate(props_logit = log(Proportion/(1-Proportion))) %>%
+  group_by(gene, current_antibiotics) %>%
+  do(tidy_lmer(nlme::lme(as.formula(form1), random = ~ 1 | SubjectID, data=., na.action=na.omit))) %>%
+  ungroup() %>%
+  filter(term != '(Intercept)') %>%
+  mutate(fdr = p.adjust(p.value, method="BH")) %>%
+  filter(p.value<0.05) %>%
+  mutate(term = sub("study_group", "Omnivore - ", term))
+
+#pander(summaries_df, split.table=Inf, digits=2, emphasize.strong.rows=which(summaries_df$fdr<0.05))
+
+summaries_df %>%
+  mutate(annotation = gtools:::stars.pval(fdr)) %>%
+  write.table(file="farmm_butyrate_EENinteraction_fdrNotSeparated.txt", sep='\t', quote=F, row.names=F)
+```
+
+
+Butyrate figure
+
+```{r}
+temp_met <- metabolites %>%
+  filter(HMDB.ID %in% c("HMDB00039")) %>%
+  mutate(Metabolite = paste(Metabolite, SampleType, sep="_") ) %>%
+  select(SubjectID, study_group, study_day, name = Metabolite, value = met_value_log, Age, BMI) %>%
+  mutate(value_log = value) %>%
+  mutate(name = gsub("-", "_", name)) %>%
+  filter(!is.na(study_day)) %>%
+  droplevels()
+
+
+
+temp_met %>%
+  #mutate(study_day = factor(study_day)) %>%
+  group_by(study_group, study_day) %>%
+  summarize(mean_value = mean(value), se_value = se(value)) %>%
+  ungroup() %>%
+  ggplot(aes(x=study_day, y=mean_value, color=study_group, fill=study_group, group=study_group)) +
+    geom_rect(fill="gray90", color="gray90", alpha=0.5, xmin=6, xmax=8, ymin=-Inf, ymax=Inf) +
+    geom_point() + 
+    geom_line() +
+    geom_ribbon(aes(ymax = mean_value + se_value, ymin = mean_value - se_value), alpha=0.2) +
+    theme_bw() +
+    scale_x_continuous(breaks=c(0,3,6,9,12,15)) +
+    theme(
+      panel.grid.major = element_blank(), 
+      panel.grid.minor = element_blank(),
+      aspect.ratio=1) +
+    scale_color_manual(values=ann_colors$study_group) +
+    labs(x="Study day", color="", fill="",
+         y="Stool butyrate levels")
+  
+ggsave("Fig4_farmm_stool_butyrate.pdf", width=3.2, height=2.5, useDingbats=F)
+```
+
+```{r}
+temp_met <- temp_met %>%
+  filter(study_day != 12) %>%
+  mutate(study_day_factor = factor(study_day)) %>%
+  droplevels()
+contrasts(temp_met$study_day_factor) <- matrix(c(-3/4, 1/4, 1/4, 1/4, -1/2, -1/2, 1/2, 1/2, -1/4, -1/4, -1/4, 3/4), ncol = 3)
+```
+
+value ~ Age + BMI + study_day_factor * study_group
+
+```{r}
+temp_met %>%
+  group_by(name) %>%
+  do(tidy_lmer(nlme::lme(value ~ Age + BMI + study_day_factor * study_group, random=~1|SubjectID, data=., na.action=na.omit))) %>%
+  ungroup() %>%
+  mutate(term = sub("study_group", "Omnivore - ", term)) %>%
+  mutate(term = sub("study_day_factor1", "days 0-5", term)) %>%
+  mutate(term = sub("study_day_factor2", "days 5-9", term)) %>%
+  mutate(term = sub("study_day_factor3", "days 9-15", term)) %>%
+  pander(split.table=Inf, digits=2)
+```
+
+value ~ Age + BMI + study_group for each day
+
+```{r}
+temp_met %>%
+  group_by(name, study_day) %>%
+  do(tidy(lm(value ~ Age + BMI + study_group, data=.))) %>%
+  ungroup() %>%
+  mutate(term = sub("study_group", "Omnivore - ", term)) %>%
+  pander(split.table=Inf, digits=2)
+
+
+```
+
+
+
+
+# Figure 5A: Alignments to IPA genes
+
+
+```{r}
+ipa_counts <- read.delim(file.path(data_dir, "farmm_ipa_hits.txt")) %>%
+  mutate(SubjectID = as.character(SubjectID)) %>%
+  mutate(SampleID = as.character(SampleID)) %>%
+  filter(SampleID %in% s_toTest$SampleID) %>%
+  mutate(study_group = factor(study_group, levels=levels(s_toTest$study_group))) %>%
+  mutate(study_day = as.numeric(as.character(study_day))) %>%
+  mutate(current_antibiotics = factor(current_antibiotics, levels=levels(s_toTest$current_antibiotics))) %>%
+  droplevels()
+
+ipa_props <- ipa_counts %>%
+  group_by(SampleID, gene_name) %>%
+  summarize(count = sum(n)) %>%
+  ungroup() %>%
+  merge(s_toTest, by="SampleID")
+
+```
+
+
+```{r fig.height=5, fig.width=7, warning=F, message=F}
+
+ipa_props %>%
+  group_by(study_group, study_day, gene) %>%
+  summarize(mean_ab = mean(Proportion), se_ab = se(Proportion)) %>%
+  ungroup() %>%
+  mutate(gene = reorder(gene, -mean_ab)) %>%
+  ggplot(aes(x=study_day, y=mean_ab, group=study_group, color=study_group, fill=study_group)) +
+    geom_rect(fill="gray90", color="gray90", alpha=0.5, xmin=6, xmax=8, ymin=-Inf, ymax=Inf) +
+    geom_point() +
+    geom_line() +
+    theme_bw() +
+    theme(
+      strip.background = element_blank(),
+      panel.grid = element_blank(),
+      aspect.ratio = 1) +
+    scale_y_continuous(labels=scales:::percent) +
+    scale_x_continuous(breaks=c(0,3,6,9,12,15)) +
+    geom_ribbon(aes(ymax = mean_ab + se_ab, ymin = mean_ab - se_ab), alpha=0.2) +
+    scale_color_manual(values=ann_colors$study_group) +
+    scale_fill_manual(values=ann_colors$study_group) +
+    facet_wrap(~ gene, scale="free", ncol=3) +
+    labs(x="Study day", color="", fill="",
+         y="Relative abundance of butyrate genes")
+ggsave("Fig5_ipa_genes.pdf", height=6, width=7)
+```
+
+
+
+```{r}
+temp_met <- metabolites %>%
+  filter(HMDB.ID %in% c("HMDB00929", "HMDB00671", "HMDB02302")) %>%
+  filter(!grepl("QPP|QPS", SampleID)) %>%
+  select(SubjectID, study_group, study_day, name = Metabolite, SampleType, value_log = met_value_log, BMI, Age) %>%
+  mutate(study_group = factor(study_group)) %>%
+  mutate(name = gsub("-", "_", name)) %>%
+  droplevels()
+```
+
+
+
+
+
+```{r}
+## figure for the interediate metabolites
+temp_met %>%
+  group_by(study_group, study_day, name, SampleType) %>%
+  summarize(mean_ab = mean(value_log), se_ab = se(value_log)) %>%
+  ungroup() %>%
+  mutate(name = reorder(name, -mean_ab)) %>%
+  ggplot(aes(x=study_day, y=mean_ab, group=study_group, color=study_group, fill=study_group)) +
+    geom_rect(fill="gray90", color="gray90", alpha=0.5, xmin=6, xmax=8, ymin=-Inf, ymax=Inf) +
+    geom_point() +
+    geom_line() +
+    theme_bw() +
+    theme(
+      strip.background = element_blank(),
+      panel.grid = element_blank(),
+      aspect.ratio = 1
+    ) +
+    scale_x_continuous(breaks=c(0,3,6,9,12,15)) +
+    geom_ribbon(aes(ymax = mean_ab + se_ab, ymin = mean_ab - se_ab), alpha=0.2) +
+    scale_color_manual(values=ann_colors$study_group) +
+    scale_fill_manual(values=ann_colors$study_group) +
+    facet_wrap(.~name+SampleType, scales="free_x", ncol=2) +
+    labs(x="Study day", color="", fill="",
+         y="Relative abundance of interediate metabolites")
+    
+ggsave("Fig5_ipa_metabolites.pdf", height=5, width=5, useDingbats=F)
+```
+
+
+
+
+
+
+Linear mixed effects model on the logit transformed relative abundance of butyrate producing genes. Mulyiple tests have been adjusted for false discovery rate using Benjamini-Hochberg method. The pre, during and post antibiotics time points have been tested for separately. 
+
+```{r}
+form1 <- "props_logit ~ BMI + Age + study_group * study_day"
+summaries_df <- ipa_props %>%
+  mutate(props_logit = log(Proportion/(1-Proportion))) %>%
+  group_by(gene, current_antibiotics) %>%
+  do(tidy_lmer(nlme::lme(as.formula(form1), random = ~ 1 | SubjectID, data=., na.action=na.omit))) %>%
+  ungroup() %>%
+  filter(term != '(Intercept)') %>%
+  #group_by(term) %>%
+  mutate(fdr = p.adjust(p.value, method="BH")) %>%
+  #ungroup() %>%
+  filter(p.value<0.05) %>%
+  mutate(term = sub("study_group", "Omnivore - ", term))
+
+pander(summaries_df, split.table=Inf, digits=2, emphasize.strong.rows=which(summaries_df$fdr<0.05))
+```
+
+
+
+
+```{r}
+temp_met_test <- temp_met %>%
+  filter(study_day != 12) %>%
+  mutate(study_day_factor = factor(study_day)) %>%
+  droplevels()
+contrasts(temp_met_test$study_day_factor) <- matrix(c(-3/4, 1/4, 1/4, 1/4, -1/2, -1/2, 1/2, 1/2, -1/4, -1/4, -1/4, 3/4), ncol = 3)
+
+temp_met_test %>%
+  group_by(name, SampleType) %>%
+  do(tidy_lmer(nlme::lme(value_log ~ BMI + Age + study_day_factor * study_group, random=~1|SubjectID, data=., na.action=na.omit))) %>%
+  ungroup() %>%
+  mutate(term = sub("study_group", "Omnivore - ", term)) %>%
+  mutate(term = sub("study_day_factor1", "days 0-5", term)) %>%
+  mutate(term = sub("study_day_factor2", "days 5-9", term)) %>%
+  mutate(term = sub("study_day_factor3", "days 9-15", term)) %>%
+  pander(split.table=Inf, digits=2)
+
+
+
+```
+
+
+# Figure 5B: IPA Comprehensive linear model
+
+We are trying to estimate the amount of variance that is explained by tryptophan, indolelactate metabolites and fldH, fldB, fldC, acdA genes in the production of indolepropionic acid (indole-3-propionate). The intermediate metabolites indolepyruvic acid and indoleacrylic acid were not found in the metabolome results and were omitted from the model.
+
+
+
+```{r}
+
+temp_gene <- ipa_props %>%
+  mutate(props_logit = log(Proportion/(1-Proportion))) %>%
+  select(SubjectID, study_group, study_day, name = gene, value = Proportion, value_log = props_logit, Age, BMI) %>%
+  mutate(study_day = ifelse(study_group=="Vegan"& study_day==1, 0, study_day))
+
+
+temp <- bind_rows(temp_met, temp_gene) %>%
+  filter(!is.na(study_day)) %>%
+  select(-value) %>%
+  mutate(name = ifelse(!is.na(SampleType), paste(name, SampleType, sep="_"), name)) %>%
+  select(-SampleType) %>%
+  spread(name, value_log) %>%
+  filter(study_day %in% c(0, 5, 9, 12, 15)) %>%
+  mutate(study_group = factor(study_group, levels=c("Omnivore", "Vegan", "EEN"))) %>%
+  mutate(IPA_stool_binary = indole_3_propionate_Feces>0) %>%
+  mutate(IPA_plasma_binary = indole_3_propionate_Plasma>0)
+
+
+tidy_glmer <- function(glmer_test) {
+  tidy(glmer_test) %>%
+    mutate(conv = ifelse(is.null(glmer_test@optinfo$conv$lme4$code), NA, glmer_test@optinfo$conv$lme4$code)) %>%
+    mutate(AIC = AIC(glmer_test))
+}
+```
+
+
+```{r}
+glmer_ipa_results <- rbind(
+tidy_glmer(lme4::glmer(IPA_stool_binary ~ BMI + Age + acdA + fldB + fldC + fldH + (1|SubjectID), data=temp, family="binomial")) %>%
+  mutate(SampleType = "Stool"),
+
+tidy_glmer(lme4::glmer(IPA_plasma_binary ~ BMI + Age +  acdA + fldB + fldC + fldH + (1|SubjectID), data=temp, family="binomial")) %>%
+  mutate(SampleType = "Plasma")
+) %>%
+  filter(!grepl("Intercept", term))
+
+
+glmer_ipa_results %>%
+  filter(!term %in% c("Age", "BMI")) %>%
+  mutate(term = factor(term)) %>%
+  mutate(term = fct_rev(term)) %>%
+  #mutate(term = fct_reorder(term, estimate)) %>%
+  ggplot(aes(x=term, y=estimate, ymin=estimate-std.error, ymax=estimate+std.error)) +
+    geom_pointrange() +
+    coord_flip() +
+    facet_grid(SampleType~.) +
+    theme_bw() +
+    theme(
+      strip.background = element_blank(),
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank()
+    ) +
+    labs(
+      y="Estimated difference\nin gene abundance", x=""
+    )
+ggsave("Fig5B_glmer_ipa_results.pdf", width=2, height=2)
+
+```
+
+
+# Figure S5A
+
+
+```{r}
+ipa_taxids <- data_frame(
+  genbank = c("BK010268.1", "BK010335.1", "BK010336.1", "BK010337.1", "GCA_000155085_fldAIBC"),
+  organism = c("Clostridium cadaveris CC40 001C",
+               "Clostridium cadaveris CC44 001G",
+               "Clostridium cadaveris CC88A",
+               "Peptostreptococcus anaerobius CC14N",
+               "Clostridium sporogenes ATCC 15579"
+               )
+)
+
+c_ipa <- read.delim(file.path(data_dir, "farmm_ipa_genome_alignment.txt")) %>%
+  merge(s_toTest, by="SampleID", all.y=T) %>%
+  merge(ipa_taxids, by.x="Segment", by.y="genbank")
+```
+
+```{r}
+
+c_ipa %>%
+  mutate(organism = sub(" ", "\n", organism)) %>%
+  mutate(organism = sub(" ", "\n", organism)) %>%
+  ggplot(aes(x=study_day, y=num_reads_matched+1, group=study_group, color=SubjectID)) +
+    geom_rect(fill="gray90", color="gray90", alpha=0.5, xmin=6, xmax=8, ymin=-Inf, ymax=Inf) +
+    #geom_rect(fill="gray90", color="gray90", alpha=0.5, xmin=12, xmax=15, ymin=-Inf, ymax=Inf) +
+    geom_point() +
+    theme_bw() +
+    theme(
+      strip.background = element_blank(),
+      panel.grid = element_blank()) +
+    #scale_x_continuous(breaks=c(0,6,8,12,15)) +
+    scale_x_continuous(breaks=c(0,3,6,9,12,15)) +
+    scale_y_log10() +
+    facet_grid(organism ~ study_group) +
+    guides(color=F) +
+    labs(x="Study day", color="", fill="",
+         y="Number of reads that mapped to the  IPA genomic region")
+ggsave("FigS5A_IPA_coverage.pdf", height=6.5, width=5, useDingbats=F)
+```
+
+
+# Figure S5B
+
+```{r fig.width=5, fig.height=7, eval=F}
+
+ipa_counts %>%
+  filter(SampleID %in% s_toTest$SampleID) %>%
+  filter(!is.na(common_taxa)) %>%
+  filter(!is.na(n)) %>%
+  group_by(common_taxa, study_group) %>%
+  summarize(gene_counts = sum(n)) %>%
+  ungroup() %>%
+  
+  ggplot() +
+    geom_bar(aes(x=common_taxa, y=gene_counts, fill=study_group), position="dodge", stat="identity") +
+    scale_fill_manual(values=ann_colors$study_group) +
+    #scale_y_discrete(breaks = scales::pretty_breaks(n = 2)) + 
+    coord_flip() +
+    theme_bw() + 
+    theme(
+      legend.position="bottom",
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      axis.text.x = element_text(angle = 90, hjust = 1, vjust=0.5)) +
+    labs(x="", y="Number of reads", fill="")
+
+ggsave("FigS5B_ipa_genes_by_taxa.pdf", height = 3, width=5, useDingbats=F)
+```
+
+
+
+
+# Figure 6A: Stool metabolite PCA
+
+```{r}
+metabolites_toPlot <- metabolites %>%
+  filter(SampleType == "Feces") %>%
+  #filter(grepl("HILIC", Method)) %>%
+  filter(!HMDB.ID %in% c("Internal Standard", "n/a")) %>%
+  filter(SampleID %in% s_meta$SampleID) %>%
+  droplevels() %>%
+  mutate(label = paste(Method, HMDB.ID, Metabolite)) %>%
+  select(label, met_value_log, SampleID) %>%
+  spread(SampleID, met_value_log)
+
+metabolites_toPlot[is.na(metabolites_toPlot)] <- 0
+rownames(metabolites_toPlot) <- metabolites_toPlot$label
+metabolites_toPlot <- select(metabolites_toPlot,-label)
+metabolites_toPlot <- as.matrix(metabolites_toPlot)
+
+pca <- prcomp(t(metabolites_toPlot))
+pc_pct <- round((pca$sdev^2) / sum(pca$sdev^2) * 100)
+
+pc_df <- s_meta %>%
+  merge(pca$x[,1:2], by.x="SampleID", by.y="row.names") %>%
+  mutate(study_day = factor(study_day)) 
+
+pc_df_averages <- pc_df %>%
+  group_by(study_group, study_day) %>%
+  summarize(Axis.1_mean = mean(PC1), Axis.2_mean= mean(PC2)) %>%
+  ungroup() 
+
+pc_df_averages_path <- merge(pc_df_averages,pc_df_averages, by="study_group") %>%
+  filter(as.numeric(study_day.y)-as.numeric(study_day.x) == 1) %>%
+  select(-study_day.y) %>%
+  rename(study_day = study_day.x) 
+
+
+pc_df %>%
+  ggplot(aes(x=PC1, y=PC2, shape=study_group, linetype=study_group)) +
+    geom_point(aes(color=study_day)) +
+    geom_segment(data=pc_df_averages_path, aes(x=Axis.1_mean.x, y=Axis.2_mean.x, xend=Axis.1_mean.y, yend=Axis.2_mean.y), arrow=arrow(length = unit(0.05, "in"))) +
+    scale_color_viridis(discrete = T, end=0.9, direction=-1) +
+    scale_shape_manual(values=c(0,1,2)) +
+    theme_bw() +
+    theme(
+      strip.background = element_blank(),
+      axis.ticks = element_blank(),
+      axis.text = element_blank(),
+      panel.grid = element_blank()
+    ) +
+    labs(
+      color="Study\nday", shape="", linetype="",
+      x=paste0("PCA axis 1 (", pc_pct[1], "%)"),
+      y=paste0("PCA axis 2 (", pc_pct[2], "%)")
+    )
+ggsave("Fig6A_farmm_stool_metabolite_PCA.pdf", height=3, width=4, useDingbats=F)
+```
+
+PERMANOVA test on Euclidean distances using metabolite data.
+
+```{r}
+
+metabolites_toPlot <- metabolites %>%
+  filter(SampleType == "Feces") %>%
+  filter(!HMDB.ID %in% c("Internal Standard", "n/a")) %>%
+  filter(SampleID %in% s_meta$SampleID) %>%
+  droplevels() %>%
+  mutate(label = paste(Method, HMDB.ID, Metabolite)) %>%
+  select(label, met_value_log, SampleID) %>%
+  spread(SampleID, met_value_log)
+
+metabolites_toPlot[is.na(metabolites_toPlot)] <- 0
+rownames(metabolites_toPlot) <- metabolites_toPlot$label
+metabolites_toPlot <- select(metabolites_toPlot,-label)
+metabolites_toPlot <- as.matrix(metabolites_toPlot)
+
+euc <- vegdist(t(metabolites_toPlot), method="euclidean")
+
+summaries_df <- s_meta %>%
+  filter(SampleID %in% colnames(metabolites_toPlot)) %>%
+  group_by(SampleType, study_day) %>%
+  do(permanova_posthoc(dist_subset(euc, .$SampleID), ., "BMI + Age + study_group", 999, strata=NULL, "study_group", p_cutoff=1)) %>%
+  ungroup() %>%
+  filter(!Term %in% c("Residuals", "Total")) %>%
+  mutate(fdr = p.adjust(p.value, method="BH"))
+
+summaries_df %>%
+  select(study_day, SampleType, comparison, Term, Df, R2, p.value, fdr) %>%
+  filter(p.value < 1) %>%
+  pander(split.table=Inf, digits=2, emphasize.strong.rows = which(.$fdr < 0.05 & .$Term != "BMI"))
+```
+
+
+
+
+
+
+

@@ -1,0 +1,286 @@
+
+
+
+```{r import libraries, message=F, warning=F}
+library(qiimer)
+library(vegan)
+library(ape)
+library(kylemisc)
+
+library(dplyr)
+library(forcats)
+library(tidyr)
+library(reshape2)
+
+library(ggplot2)
+library(ggbeeswarm)
+library(pheatmap)
+library(RColorBrewer)
+library(viridis)
+#library(gridExtra)
+
+library(pander)
+library(broom)
+#library(lme4)
+library(nlme)
+#library(emmeans)
+```
+
+
+
+```{r}
+read_kraken <- function(filepath) {
+  df <- read.delim(filepath, comment.char="#")
+  props <- as.matrix(df[,-1])
+  rownames(props) <- df[,1]
+  props
+}
+
+se <- function(x) sd(x, na.rm=T)/sqrt(length(x))
+
+tidy_permanova <- function(anov){
+  data.frame(Term = rownames(anov$aov.tab), anov$aov.tab, row.names = NULL) %>%
+    rename(p.value = Pr..F.)
+}
+
+shuffle_within_groups <- function(x,g) {
+  ave(x, g, FUN = function(a) if(length(a)>1) sample(a) else a)
+}
+
+permanova_with_shuffle_2_groups <- function(dist_matrix, s_toTest, group_label1, group_label2, rep_mes_label, covariates, perm, first_within=F, second_within=F){
+  set.seed(1)
+  s_toTest <- as.data.frame(s_toTest)
+  dist_toTest <- usedist::dist_subset(dist_matrix, s_toTest$SampleID)
+  form1 <- paste("dist_toTest", "~", group_label1, " * ", group_label2)
+  if (!is.na(covariates)) {
+    form1 <- paste(form1, " + ", covariates)
+  }
+  a_ixn_orj <- adonis(as.formula(form1), data=s_toTest, permutations=perm)
+  
+  terms_perm <- c(group_label1, group_label2, paste0(group_label1, ":", group_label2))
+  
+  tidy_output <- tidy_permanova(a_ixn_orj)
+  f_ixn_all <- tidy_output[match(terms_perm, tidy_output$Term),"F.Model"]
+  #select(Term, F.Model)
+  
+  fs_permuted <- replicate(perm, {
+    s_permuted <- s_toTest
+    
+    if (first_within) {
+      s_permuted[,group_label1] <- shuffle_within_groups(s_permuted[,group_label1], s_permuted[,rep_mes_label])
+    } else {
+      s_permuted[,group_label1] <- shuffle_between_groups(s_permuted[,group_label1], s_permuted[,rep_mes_label])
+    }
+    
+    if (second_within) {
+      s_permuted[,group_label2] <- shuffle_within_groups(s_permuted[,group_label2], s_permuted[,rep_mes_label])
+    } else {
+      s_permuted[,group_label2] <- shuffle_between_groups(s_permuted[,group_label2], s_permuted[,rep_mes_label])
+    }
+    
+    a_permuted <- adonis(as.formula(form1), s_permuted, permutations = 4)
+    
+    temp_output <- tidy_permanova(a_permuted)
+    temp_output[match(terms_perm, temp_output$Term),"F.Model"]
+    #c(a_permuted_g1$aov.tab[1, 4], a_permuted_g2$aov.tab[1, 4], a_permuted$aov.tab[3, 4])
+  })
+  
+  p_ixn <- rowSums(cbind(f_ixn_all, fs_permuted) >= f_ixn_all, na.rm = T) / (dim(fs_permuted)[2] + 1)
+  
+  tidy_output[match(terms_perm, tidy_output$Term),"p.value"] <- p_ixn
+  tidy_output  
+}
+
+
+
+permanova_with_shuffle_posthoc <- function(dist_matrix, s_toTest, group_label1, group_label2, rep_mes_label, covariates, perm, first_within=F, second_within=F, p_cutoff=0.05){
+  s_toTest <- data.frame(s_toTest)
+  a_ixn <- permanova_with_shuffle_2_groups(dist_matrix, s_toTest, group_label1, group_label2, rep_mes_label, covariates, perm=perm, first_within, second_within)
+  combs <- combn(unique(s_toTest[,group_label1]), 2)
+  num_tests <- dim(combs)[2]
+  
+  # do post hoc tests
+  if (a_ixn[1,]$p.value < p_cutoff) {
+    post_hocs <- lapply(1:num_tests,
+           function(x) data.frame(comparison = paste(combs[,x], collapse=' - '),
+                                  permanova_with_shuffle_2_groups(dist_matrix,
+                                                                  s_toTest[is.element(s_toTest[,group_label1], combs[,x]),],
+                                                                  group_label1,
+                                                                  group_label2,
+                                                                  rep_mes_label,
+                                                                  covariates,
+                                                                  perm=perm,
+                                                                  first_within,
+                                                                  second_within) ))
+    a_ixn <- rbind(data.frame(comparison="all", a_ixn), do.call(rbind, post_hocs))
+  }
+  a_ixn
+}
+
+permanova_with_shuffle_1_group_posthoc <- function(dist_matrix, s_toTest, group_label, rep_mes_label, perm, is_within, p_cutoff=0.05){
+  s_toTest <- data.frame(s_toTest)
+  a_ixn <- permanova_with_shuffle_1_group(dist_matrix, s_toTest, group_label, rep_mes_label, perm=perm, is_within)[1,]
+  combs <- combn(unique(s_toTest[[group_label]]), 2)
+  num_tests <- dim(combs)[2]
+  
+  # do post hoc tests
+  if (a_ixn$p.value < p_cutoff) {
+    post_hocs <- lapply(1:num_tests,
+           function(x) data.frame(comparison = paste(combs[,x], collapse=' - '),
+                                  permanova_with_shuffle_1_group(dist_matrix, s_toTest[s_toTest[[group_label]] %in% combs[,x],], group_label, rep_mes_label, perm=perm, is_within)[1,] ))
+    a_ixn <- rbind(data.frame(comparison="all", a_ixn), do.call(rbind, post_hocs))
+  }
+  a_ixn
+}
+
+
+permanova_with_shuffle_1_group <- function(dist_matrix, s_toTest, group_label, rep_mes_label, perm, is_within=F){
+  dist_toTest <- usedist::dist_subset(dist_matrix, s_toTest$SampleID)
+  form1 <- paste("dist_toTest", "~", group_label)
+  a_ixn <- adonis(as.formula(form1), data=s_toTest, permutations=perm)
+  f_ixn <- a_ixn$aov.tab[1, 4]
+  set.seed(1)
+  
+  fs_permuted <- replicate(perm, {
+    s_permuted <- s_toTest
+    if (is_within){
+      s_permuted[,group_label] <- shuffle_within_groups(s_permuted[,group_label], s_permuted[,rep_mes_label])
+    } else {
+      s_permuted[,group_label] <- shuffle_between_groups(s_permuted[,group_label], s_permuted[,rep_mes_label])
+    }
+    a_permuted <- adonis(as.formula(form1), s_permuted, permutations = 4)
+    a_permuted$aov.tab[1, 4]
+  })
+  p_ixn <- sum(c(f_ixn, fs_permuted) >= f_ixn) / (length(fs_permuted) + 1)
+  a_ixn$aov.tab[1,6] <- p_ixn
+  tidy_permanova(a_ixn)
+}
+
+tidy_lmer <- function(lmer_test) {
+  mod <- summary(lmer_test)
+  data.frame(term  = rownames(mod$tTable), mod$tTable, row.names=NULL)
+}
+
+run_lmer_start_with_props <- function(props_toTest, s_toTest, form1, rep_mes_label, p_cutoff, add_ab=0.0001) {
+  rep_mes_form <- paste("~ 1 |", rep_mes_label)
+  props_toTest[,s_toTest$SampleID] %>%
+    melt() %>%
+    setNames(c("Taxa", "SampleID", "props")) %>%
+    mutate(props = ifelse(props<1-add_ab, props+add_ab, props-add_ab)) %>%
+    merge(s_toTest, by="SampleID") %>%
+    mutate(props_logit = log(props/(1-props))) %>%
+    group_by(Taxa) %>%
+    mutate(props_logit_scaled = scale(props_logit)[,1]) %>%
+    do(tidy_lmer(nlme::lme(as.formula(form1), random = as.formula(rep_mes_form), data=., na.action=na.omit))) %>%
+    ungroup() %>%
+    #filter(term != '(Intercept)') %>%
+    #group_by(term) %>%
+    mutate(fdr = p.adjust(p.value, method="BH")) %>%
+    #ungroup() %>%
+    filter(p.value<p_cutoff) 
+}
+
+tidy_lm_posthoc <- function(lm_test, study_group) {
+  form1 <- paste("pairwise ~", study_group)
+  mod <- anova(lm_test)
+  bind_rows(data.frame(contrast = rownames(mod), mod, row.names=NULL) %>%
+              rename(p.value="Pr..F.", df="Df"),
+            data.frame(emmeans(lm_test, list(as.formula(form1)), adjust="tukey")[[2]])
+            ) %>%
+    #mutate(AIC = AIC(lm_test)) %>%
+    select(contrast, p.value, everything())
+}
+
+permanova_test <- function(dist_matrix, s_toTest, form1, perm, strata=NULL){
+  set.seed(42)
+  if (!grepl("~", form1)) {
+    form1 <- paste0("dist_matrix ~ ", form1)
+  }
+  dist_matrix <- dist_subset(dist_matrix, s_toTest$SampleID)
+  form1 <- as.formula(form1)
+  if(is.null(strata)) {
+    tidy_permanova(adonis(form1, data=s_toTest, permutations=perm))
+  } else {
+    tidy_permanova(adonis(form1, data=s_toTest, permutations=perm, strata=s_toTest[,strata]))
+  }
+}
+
+permanova_posthoc <- function(dist_matrix, s_toTest, form1, perm, strata=NULL, group_label, p_cutoff=0.05){
+  s_toTest <- as.data.frame(s_toTest) %>% droplevels()
+  if (!grepl("~", form1)) {
+    form1 <- paste0("dist_matrix ~ ", form1)
+  }
+  a_ixn <- permanova_test(dist_matrix, s_toTest, form1, perm, strata) %>%
+    mutate(comparison = "all")
+  combs <- combn(as.character(unique(s_toTest[[group_label]])), 2)
+  num_tests <- dim(combs)[2]
+  
+  # do post hoc tests
+  if (filter(a_ixn, Term == group_label)$p.value < p_cutoff) {
+    for (i in 1:num_tests){
+      s_temp <- filter(s_toTest, .data[[group_label]] %in% combs[,i])
+      #dist_toTest = dist_subset(dist_matrix, s_temp$SampleID)
+      a_ixn <- rbind(a_ixn,
+        permanova_test(dist_matrix, s_temp, form1, perm, strata) %>%
+          mutate(comparison = paste(combs[,i], collapse=' - '))
+      )
+    }
+  }
+  a_ixn
+}
+```
+
+
+
+```{r define constants}
+perm <- 99
+term_order <- c("Omnivore slope", "Omnivore intercept", "Vegan slope", "Vegan intercept", "EEN slope", "EEN intercept", "BMI")
+
+data_dir <- "../data"
+mapping_file_name <- file.path(data_dir, "20200619_farmm_metadata.tsv")
+taxonomic_fp <- file.path(data_dir, "kraken_results.tsv")
+ko_fp <- file.path(data_dir, "ko_results.tsv")
+```
+
+```{r load metadata}
+s <- read.delim(mapping_file_name, sep='\t', stringsAsFactors = FALSE) %>%
+  mutate(SampleID = as.character(SampleID)) %>%
+  mutate(SubjectID = as.character(SubjectID)) %>%
+  mutate(study_group = factor(study_group, levels=c("Omnivore", "Vegan", "EEN"))) %>%
+  mutate(current_antibiotics = factor(current_antibiotics, levels=c("Pre Antibiotics", "Antibiotics Treatment", "Post Antibiotics")))
+```
+
+
+```{r load taxonomy info}
+cts <- read_kraken(taxonomic_fp)
+
+# Metadata in the form of truncated green genes assignments
+md <- sub("(; [kpcofgs]__)+$", "", rownames(cts), perl=T)
+md <- gsub("[kpcofgs]__", "", md)  
+
+# Assignments data-frame
+adf <- split_assignments(md, split="\\|")
+a <- simplify_assignments(adf, rank1 = "Phylum", rank2="Species")
+
+props <- rowsum(cts, a)
+
+a_p <- as.character(adf$Phylum)
+a_p[is.na(a_p)] <- "unclassified"
+props_p <- rowsum(cts, a_p)
+```
+
+```{r alpha diversity}
+s <- s %>%
+  merge(data.frame(shannon=diversity(t(props), index='shannon')), by.x="SampleID", by.y='row.names', all.x = T)
+```
+
+```{r beta diversity}
+bc <- vegdist(t(props))
+```
+
+```{r}
+ann_colors <- list(
+  study_group = setNames(c(Omnivore="#E41A1C", Vegan="#4DAF4A", EEN="#377EB8"), levels(s$study_group)),
+  current_antibiotics = setNames(brewer.pal(9, "YlOrRd")[c(2,5,9)], levels(s$current_antibiotics))
+)
+```

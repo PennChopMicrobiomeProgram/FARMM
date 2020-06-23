@@ -1,0 +1,649 @@
+---
+title: "FARMM compositional analysis"
+author: "PennCHOP Microbiome Program"
+date: \today
+output: 
+  pdf_document:
+    toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  tidy=FALSE,
+  cache=FALSE,
+  echo=FALSE,
+  warning=FALSE,
+  message=FALSE,
+  dpi=100,
+  fig.width=6,
+  fig.height=4,
+  fig.align = "center"
+  )
+```
+
+
+```{r child = 'farmm_preamble.Rmd'}
+```
+
+# Introduction
+
+FARMM study
+
+Shotgun metagenomic sequencing of fecal samples from 30 healthy human subjects at various timepoints with defined diets.
+
+Taxonomic assignments were performed using the MetaPhlAn2 program. This software uses a small database of clade-specific marker genes to identify bacterial, fungal, archaeal, and viral taxa in shotgun metagenomics data.  This method sometimes misses low-abundance organisms because of the small database size.  However, taxa identified here are very likely to be authentically present in the data. The Virus assignments have been removed from the analyses.
+
+
+
+
+```{r}
+s_toTest <- s %>%
+  filter(Keep) %>%
+  filter(!isControl) %>%
+  filter(project == "FARMM") %>%
+  mutate(study_day = as.numeric(as.character(study_day))) %>%
+  droplevels()
+```
+
+
+
+# Figure 1A: Quality control step summary
+
+```{r fig.width=7, fig.height=2}
+s_toTest %>%
+  mutate(`Low quality` = (fwd_only + rev_only + dropped) / input) %>%
+  mutate(Host = host / input) %>%
+  mutate(`Non-host` = non_host / input) %>%
+  arrange(desc(Host)) %>%
+  mutate(Sample_num=row_number()) %>%
+  melt(c("Sample_num", "study_day", "study_group"), c("Low quality", "Host", "Non-host")) %>%
+  ggplot(aes(x=Sample_num, y=value)) +
+    geom_area(aes(fill=variable), position='stack') + 
+    facet_grid(.~study_day, scales = "free_x") +
+    scale_fill_manual(values=c("#9C9C9C", "#A6CEE3", "#1F78B4")) + 
+    theme(axis.text.x = element_blank(), axis.ticks.x = element_blank(), strip.background = element_blank()) +
+    scale_x_continuous(expand=c(0,0)) +
+    scale_y_continuous(expand=c(0,0), labels=scales:::percent) +
+    labs(x="Samples", y="Percentage of reads", fill="")
+ggsave("Fig1A_farmm_quality.pdf", height=2, width=7, useDingbats=F)
+```
+
+
+
+
+# Figure 1F: QPCR results
+
+```{r}
+library(scales)
+s_toTest %>%
+  group_by(study_group, study_day) %>%
+  summarize(mean_fraction = mean(copy_num_per_gram_feces, na.rm=T), se_fraction = se(copy_num_per_gram_feces)) %>%
+  ungroup() %>%
+  ggplot(aes(x=study_day, y=mean_fraction, color=study_group, fill=study_group)) +
+    geom_rect(fill="gray90", color="gray90", alpha=0.5, xmin=6, xmax=8, ymin=-Inf, ymax=Inf) +
+    geom_point() + 
+    geom_line() +
+    geom_ribbon(aes(ymax = mean_fraction + se_fraction, ymin = mean_fraction - se_fraction), alpha=0.2) +
+    theme_bw() +
+    scale_x_continuous(breaks=c(0,3,6,9,12,15)) +
+    #scale_y_log10() +
+    scale_y_log10(
+        breaks = trans_breaks("log10", function(x) 10^x),
+        labels = trans_format("log10", math_format(10^.x))
+        ) +
+    theme(
+      panel.grid = element_blank(), 
+      aspect.ratio=1) +
+    scale_color_manual(values=ann_colors$study_group) +
+    labs(x="Study day", color="", fill="",
+         y="Copy number\nper gram feces")
+
+ggsave("Fig1F_farmm_qpcr.pdf", height=2, width=4, useDingbats=F)
+
+```
+
+Linear mixed effects model. copy_num_per_gram_feces ~ Age + BMI + study_day * study_group
+
+```{r}
+summaries_df <- s_toTest %>%
+  group_by(current_antibiotics) %>%
+  do(tidy_lmer(nlme::lme(copy_num_per_gram_feces ~ Age + BMI + study_day * study_group, random=~1|SubjectID, data=data.frame(.), na.action=na.omit))) %>%
+  ungroup()
+
+
+summaries_df %>%
+  mutate(term = fct_recode(term, 
+                           `Omnivore slope` = "study_day",
+                           `Omnivore intercept` = "(Intercept)",
+                           `Vegan slope` = "study_day:study_groupVegan",
+                           `Vegan intercept` = "study_groupVegan",
+                           `EEN slope` = "study_day:study_groupEEN",
+                           `EEN intercept` = "study_groupEEN")) %>%
+  mutate(term = factor(term, levels=term_order)) %>%
+  arrange(current_antibiotics, term) %>%
+  mutate(fdr = p.adjust(p.value, method="BH")) %>%
+  pander(split.table=Inf, digits=2, emphasize.strong.rows = which(.$fdr < 0.05))
+```
+
+
+# Figure 1G: Shannon diversity
+
+The ribbons represent the standard error for each time point and diet.
+
+```{r fig.height=3}
+s_toTest %>%
+  group_by(study_group, study_day) %>%
+  summarize(mean_shannon = mean(shannon), se_shannon = se(shannon)) %>%
+  ungroup() %>%
+  ggplot(aes(x=study_day, y=mean_shannon, color=study_group, fill=study_group)) +
+    geom_rect(fill="gray90", color="gray90", alpha=0.5, xmin=6, xmax=8, ymin=-Inf, ymax=Inf) +
+    geom_point() +
+    geom_line() +
+    geom_ribbon(aes(ymax = mean_shannon + se_shannon, ymin = mean_shannon - se_shannon), alpha=0.5, color=NA) +
+    facet_wrap(~study_group) +
+    scale_color_manual(values=ann_colors$study_group) +
+    scale_x_continuous(breaks=c(0,3,6,9,12,15)) +
+    guides(color=F, fill=F) +
+    theme_bw() + 
+    theme(
+      strip.background = element_blank(),
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      aspect.ratio=1.1) +
+    labs(
+      x="Study day", color="", fill="",
+      y="Shannon diversity"
+    )
+ggsave("Fig1G_farmm_shannon.pdf", height=2, width=4)
+```
+
+
+
+We fit linear mixed effects models to the Shannon diversity measures for each stage (pre, during and post abx). The study day (0-15) and study groups (western, vegan, modulen) are fixed effects and the Subjects are random effects. The slope and y intercept for the western group are calculated first. The estimates for the vegan and western groups are relative to the estimates for the Western group. The group differences are interpreted as intercept differences and the interaction terms are interpreted as slope differences.
+
+
+Linear mixed effects model with a single "post-antibiotics" time point and the "post-antibiotics" time point broken down into reconstitution and stabilization phases split on day 12.
+
+```{r}
+summaries_df <- s_toTest %>%
+  #mutate(SubjectID = as.factor(SubjectID)) %>%
+  group_by(current_antibiotics) %>%
+  do(tidy_lmer(nlme::lme(shannon ~ Age + BMI + study_day * study_group, random=~1|SubjectID, data=., na.action=na.omit))) %>%
+  ungroup()
+
+
+summaries_df %>%  
+  mutate(term = fct_recode(term, 
+                           `Omnivore slope` = "study_day",
+                           `Omnivore intercept` = "(Intercept)",
+                           `Vegan slope` = "study_day:study_groupVegan",
+                           `Vegan intercept` = "study_groupVegan",
+                           `EEN slope` = "study_day:study_groupEEN",
+                           `EEN intercept` = "study_groupEEN")) %>%
+  mutate(term = factor(term, levels=term_order)) %>%
+  arrange(current_antibiotics, term) %>%
+  mutate(fdr = p.adjust(p.value, method="BH")) %>%
+  pander(split.table=Inf, digits=2, emphasize.strong.rows = which(.$fdr < 0.05))
+```
+
+
+# Figure 2A: PcoA plot of Bray-Curtis distances
+
+
+```{r fig.width=6, fig.height=4}
+
+pc <- pcoa(dist_subset(bc, s_toTest$SampleID))
+vectors <- data.frame(SampleID = rownames(pc$vectors), pc$vectors[,1:3])
+pc_pct <- round(pc$values$Relative_eig * 100)
+
+s_toPlot <- s_toTest %>%
+  merge(vectors, by="SampleID")
+
+s_toPlot_averages <- s_toPlot %>%
+  group_by(study_group, study_day) %>%
+  summarize(Axis.1_mean = mean(Axis.1), Axis.2_mean= mean(Axis.2)) %>%
+  ungroup() 
+
+s_toPlot_averages_path <- merge(s_toPlot_averages,s_toPlot_averages, by="study_group") %>%
+  filter(as.numeric(as.character(study_day.y))-as.numeric(as.character(study_day.x)) == 1) %>%
+  select(-study_day.y) %>%
+  rename(study_day = study_day.x) 
+
+s_toPlot %>%
+  ggplot(aes(x=Axis.1, y=Axis.2)) +
+    geom_point(alpha=0.5,  aes(color=study_day)) +
+    geom_segment(data=s_toPlot_averages_path, aes(x=Axis.1_mean.x, y=Axis.2_mean.x, xend=Axis.1_mean.y, yend=Axis.2_mean.y), arrow=arrow(length = unit(0.05, "in"))) +
+    theme_bw() +
+    theme(
+        axis.text=element_blank(),
+        axis.ticks=element_blank(),
+        panel.grid = element_blank(),
+        aspect.ratio = 1,
+        strip.background = element_blank()
+      ) +
+    scale_color_viridis(end=0.9, direction=-1) +
+    facet_grid(.~study_group) +
+    labs(x=paste0("PCoA axis 1 (", pc_pct[1], "%)"),
+         y=paste0("PCoA axis 2 (", pc_pct[2], "%)"),
+         color="Study\nday", shape="Study\ngroup", lty="")
+
+ggsave("Fig2A_farmm_PCoA_main.pdf", height=1.9, width=5, useDingbats=F)
+```
+
+
+
+
+Community level differences between the diets were estimated using PERMANOVA for each antibiotics stage separately. Pairwise post-hoc tests were carried out if the p-value was <0.05. 
+
+```{r}
+summaries_df <- s_toTest %>%
+  group_by(current_antibiotics) %>%
+  do(permanova_with_shuffle_posthoc(bc, ., "study_group", "study_day", "SubjectID", "Age + BMI", perm, first_within=F, second_within=T, p_cutoff=0.05)) %>%
+  ungroup() %>%
+  filter(!Term %in% c("Residuals", "Total"))
+
+
+summaries_df %>%
+  select(-one_of("MeanSqs", "SumsOfSqs", "F.Model")) %>%
+  mutate(Term = sub("study_group:study_day", "Interaction", Term)) %>%
+  mutate(fdr = p.adjust(p.value, method="BH")) %>%
+  pander(split.table=Inf, digits=2, emphasize.strong.rows = which(.$fdr < 0.05))
+```
+
+Community level differences are assessed at each time point using PERMANOVA.
+
+```{r}
+set.seed(123)
+
+day_results <- s_toTest %>%
+  group_by(study_day) %>%
+  do(tidy_permanova(adonis(usedist::dist_subset(bc, .$SampleID) ~ Age + BMI + study_group, data=., permutations=perm))) %>%
+  ungroup() %>%
+  filter(Term == "study_group") %>%
+  mutate(Term = "All") %>%
+  mutate(fdr = p.adjust(p.value, method="BH")) 
+
+combs <- combn(as.character(unique(s_toTest$study_group)), 2)
+num_tests <- dim(combs)[2]
+
+for (i in 1:num_tests) {
+  day_results <- s_toTest %>%
+    filter(study_group %in% combs[,i]) %>%
+    filter(study_day > 0) %>%
+    droplevels() %>%
+    group_by(study_day) %>%
+    do(tidy_permanova(adonis(usedist::dist_subset(bc, .$SampleID) ~ Age + BMI + study_group, data=., permutations=999))) %>%
+    ungroup() %>%
+    filter(Term == "study_group") %>%
+    mutate(Term = paste(combs[,i], collapse = " - ")) %>%
+    mutate(fdr = p.adjust(p.value, method="BH")) %>%
+    rbind(day_results)
+}
+
+day_results %>%
+  arrange(Term) %>%
+  filter(p.value < 0.05) %>%
+  pander(digits=2, split.table=Inf)
+```
+
+
+
+\newpage
+
+
+# Figure 2B: Differential abundance: Species level
+
+Taxa that are differentially abundant between the diet study groups are estimated using linear mixed effects models on the logit transformed proportions for each antibiotics stage (pre, during and post) separately. Only the taxa that have greater than 1% realtive abundance across the tested samples are used. The resulting p values are corrected for false discovery rate.
+
+```{r}
+# find the taxa to test on 
+top_species <- props[,s_toTest$SampleID] %>%
+  apply(1, mean) %>%
+  sort(decreasing=T)
+top_species <- names(top_species[top_species > 0.006])
+
+```
+
+
+```{r warning=F, eval=T}
+## Pre-antibiotics
+s_temp <- s_toTest %>%
+  filter(current_antibiotics == "Pre Antibiotics")
+
+props_toTest <- props[top_species,s_temp$SampleID]
+
+form1 <- "props_logit ~  Age + BMI + study_group * study_day"
+summaries_df <- run_lmer_start_with_props(props_toTest, s_temp, form1, "SubjectID", 1) %>%
+  mutate(term = sub("study_group", "Omnivore - ", term)) %>%
+  filter(!grepl("Intercept", term)) %>%
+  #filter(term == "Western - EEN:study_day") %>%
+  filter(fdr < 0.05) %>%
+  arrange(Value)
+
+summaries_df %>%
+  pander(split.table=Inf, digits=2)
+```
+
+
+```{r warning=F, fig.height=8, fig.width=13}
+taxa_toPlot <- summaries_df %>%
+  filter(grepl("EEN", term)) %>%
+  pull(Taxa) %>%
+  as.character() %>% unique()
+
+props_toPlot <- props_toTest %>%
+  melt() %>%
+  setNames(c("Taxa", "SampleID", "props")) %>%
+  merge(s_temp, by="SampleID") %>%
+  filter(Taxa %in% taxa_toPlot) %>%
+  group_by(study_group, study_day, Taxa) %>%
+  summarize(mean_prop = mean(props)) %>%
+  ungroup() 
+
+
+temp <- props_toPlot %>%
+  filter(study_group=="EEN") %>%
+  filter(study_day != 0) %>%
+  group_by(Taxa) %>%
+  summarize(mean_prop_een = mean(mean_prop)) %>%
+  ungroup()
+  
+props_toPlot <- props_toPlot %>%
+  merge(temp, by="Taxa", all.x=T) %>%
+  mutate(Taxa = fct_reorder(Taxa, -mean_prop_een)) %>%
+  select(-mean_prop_een) %>%
+  spread(Taxa, mean_prop) %>%
+  mutate(SampleID = paste(study_group, study_day, sep="_"))
+
+annotations <- props_toPlot %>%
+  select(SampleID, study_group, study_day) %>%
+  arrange(study_group)
+rownames(annotations) = annotations$SampleID
+annotations <- select(annotations, -SampleID)
+annotations <- as.data.frame(annotations)
+
+rownames(props_toPlot) <- props_toPlot$SampleID
+props_toPlot <- props_toPlot %>%
+  select(-one_of("SampleID", "study_group", "study_day")) %>%
+  t()
+
+gaps <- annotations %>%
+  group_by(study_group) %>%
+  summarize(nums = n()) %>%
+  ungroup() %>%
+  pull(nums) %>%
+  cumsum()
+
+pheatmap(props_toPlot[,rownames(annotations)], 
+         annotation_col = annotations, 
+         annotation_colors = ann_colors,
+         color = saturated_rainbow(101, saturation_limit=0.3), 
+         breaks = c(0, 1e-10, seq(0.001, 1, length.out = 100)), 
+         filename = "Fig2B_farmm_heatmap_dietPhase.pdf",
+         gaps_col=gaps,
+         fontsize_col = 8, fontsize_row = 8, 
+         cluster_cols = FALSE, cluster_rows = F,
+         cellheight = 8, cellwidth = 8)
+```
+
+
+# Figure 2C: Differential abundance: Phylum level
+
+Taxa that are differentially abundant between the diet study groups are estimated using linear mixed effects models on the logit transformed relative abundances for each antibiotics stage (pre, during and post) separately. Only the taxa that have greater than 1% realtive abundance across the tested samples are used. The resulting p values are corrected for false discovery rate.
+
+
+qPCR normalized abundances
+
+```{r}
+library(scales)
+
+props_p_with_qpcr <- props_p[c("Firmicutes", "Bacteroidetes", "Proteobacteria"),s_toTest$SampleID] %>%
+  melt() %>%
+  setNames(c("Taxa", "SampleID", "props")) %>%
+  merge(select(s_toTest, SampleID, study_group, study_day, SubjectID, current_antibiotics, Age, BMI, copy_num_per_gram_feces), by="SampleID") %>%
+  mutate(prop_qpcr = props * copy_num_per_gram_feces) 
+```
+
+```{r}
+props_p_with_qpcr %>%
+  
+  group_by(study_group, study_day, Taxa) %>%
+  summarize(mean_prop = mean(prop_qpcr, na.rm=T), se_prop = se(prop_qpcr)) %>%
+  ungroup() %>%
+  mutate(Taxa = as.factor(Taxa)) %>%
+  mutate(Taxa = fct_relevel(Taxa, "Bacteroidetes", after=0)) %>%
+  ggplot(aes(x=study_day, y=mean_prop, color=study_group, group=study_group, fill=study_group)) +
+    geom_rect(fill="gray90", color="gray90", alpha=0.5, xmin=6, xmax=8, ymin=-Inf, ymax=Inf) +
+    geom_point() +
+    geom_line() +
+    geom_ribbon(aes(ymax = mean_prop + se_prop, ymin = mean_prop - se_prop), alpha=0.2) +
+    facet_wrap(~Taxa, scales="free_x", ncol=3) +
+    theme_bw() + 
+    theme(
+      strip.background = element_blank(),
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      aspect.ratio=1.3) +
+    scale_color_manual(values=ann_colors$study_group) +
+    scale_fill_manual(values=ann_colors$study_group) +
+    scale_x_continuous(breaks=c(0,3,6,9,12,15)) +
+    scale_y_log10(
+        breaks = trans_breaks("log10", function(x) 10^x),
+        labels = trans_format("log10", math_format(10^.x))
+        ) +
+    labs(
+      x="Study day",
+      y="qPCR normalized\nabundances",
+      color="",
+      fill=""
+    )
+ggsave("Fig2C_farmm_phylum.pdf", height=2, width=5, useDingbats=F)
+```
+
+prop_qpcr ~  Age + BMI + study_group * study_day
+
+```{r}
+form1 <- "prop_qpcr ~  Age + BMI + study_group * study_day"
+
+summaries_df <- props_p_with_qpcr %>%
+  filter(!is.na(prop_qpcr)) %>%
+  mutate(prop_qpcr = log10(prop_qpcr + 1)) %>%
+  group_by(current_antibiotics, Taxa) %>%
+  do(tidy_lmer(nlme::lme(as.formula(form1), random = ~1|SubjectID, data=., na.action=na.omit))) %>%
+  ungroup() %>%
+  
+  filter(!grepl("Intercept", term)) %>%
+  
+  mutate(fdr = p.adjust(p.value, method="BH")) 
+
+
+summaries_df %>%
+  filter(fdr < 0.05) %>%
+  pander(split.table=Inf, digits=2)
+
+```
+
+
+prop_qpcr ~ Age +  BMI + current_antibiotics * study_group
+Only study days 1,2,3,4,5,13,14,15
+
+```{r}
+form1 <- "prop_qpcr ~  Age + BMI + current_antibiotics * study_group"
+
+summaries_df <- props_p_with_qpcr %>%
+  filter(!is.na(prop_qpcr)) %>%
+  mutate(prop_qpcr = log10(prop_qpcr + 1)) %>%
+  filter(study_day %in% c(1,2,3,4,5,13,14,15)) %>%
+  group_by(Taxa) %>%
+  do(tidy_lmer(nlme::lme(as.formula(form1), random = ~1|SubjectID, data=., na.action=na.omit))) %>%
+  ungroup() %>%
+  
+  filter(!grepl("Intercept", term)) %>%
+  mutate(term = sub("current_antibiotics", "Pre - ", term)) %>%
+  
+  group_by(term) %>%
+  mutate(fdr = p.adjust(p.value, method="BH")) %>%
+  ungroup()
+
+
+summaries_df %>%
+  pander(split.table=Inf, digits=2)
+
+```
+
+
+# Supplementary Figure 2: Species level heatmap
+
+
+The heatmap below illustrates the averages of the species for each time point and diet group. Only the species that are >0.5% are included in the heatmap.
+
+```{r warning=F, fig.height=8, fig.width=13}
+# heatmap with averages
+s_toPlot <- s_toTest
+props_toPlot <- props[,s_toPlot$SampleID]
+props_toPlot <- props_toPlot[apply(props_toPlot,1,mean) >= 0.005,s_toPlot$SampleID]
+
+props_toPlot <- props_toPlot %>%
+  melt() %>%
+  setNames(c("Taxa", "SampleID", "props")) %>%
+  merge(s_toPlot, by="SampleID") %>%
+  group_by(study_group, study_day, current_antibiotics, Taxa) %>%
+  summarize(mean_prop = mean(props)) %>%
+  ungroup() %>%
+  spread(Taxa, mean_prop) %>%
+  mutate(SampleID = paste(study_group, study_day, sep="_"))
+
+annotations <- props_toPlot %>%
+  select(SampleID, study_group, study_day, current_antibiotics) %>%
+  arrange(current_antibiotics, study_group)
+rownames(annotations) = annotations$SampleID
+annotations <- select(annotations, -SampleID)
+annotations <- as.data.frame(annotations)
+
+rownames(props_toPlot) <- props_toPlot$SampleID
+props_toPlot <- props_toPlot %>%
+  select(-one_of("SampleID", "study_group", "study_day", "current_antibiotics")) %>%
+  t()
+rownames(props_toPlot) <- gsub("_", " ", rownames(props_toPlot))
+
+
+gaps <- annotations %>%
+  group_by(interaction(study_group, current_antibiotics)) %>%
+  summarize(nums = n()) %>%
+  ungroup() %>%
+  pull(nums) %>%
+  cumsum()
+
+pheatmap(props_toPlot[,rownames(annotations)], 
+         annotation_col = annotations, 
+         annotation_colors = ann_colors,
+         color = saturated_rainbow(101, saturation_limit=0.4), 
+         breaks = c(0, 1e-10, seq(0.001, 1, length.out = 100)), 
+         filename = "FigS2_farmm_heatmap_species_averaged.pdf",
+         clustering_method = "ward.D",
+         gaps_col=gaps,
+         fontsize_col = 8, fontsize_row = 8, 
+         cluster_cols = FALSE, cluster_rows = TRUE,
+         cellheight = 8, cellwidth = 8)
+```
+
+
+# Supplementary Figure 3: Post study samples
+
+```{r eval=F}
+library(viridis)
+s_PS <- s %>%
+  filter(Keep) %>%
+  filter(!isControl) %>%
+  filter(study_day %in% c("1", "5", "15", "PS")) %>%
+  droplevels()
+
+dm <- usedist::dist_subset(bc, s_PS$SampleID)
+pc <- pcoa(dm)
+pc_df <- merge(s_PS, pc$vectors[, 1:3], by.x="SampleID", by.y="row.names") %>%
+  mutate(study_day = fct_relevel(study_day, "PS", after=Inf)) %>%
+  mutate(study_day = fct_relevel(study_day, "5", after=1)) %>%
+  mutate(study_group = fct_recode(study_group, Omnivore="Western", EEN="Modulen")) %>%
+  mutate(study_day = fct_recode(study_day, `Day 1`="1", `Day 5`="5", `Day 15`="15")) 
+pc_pct <- round(pc$values$Relative_eig * 100)
+
+ggplot(pc_df, aes(x=Axis.1, y=Axis.2, color=study_group)) +
+  geom_point() +
+  scale_color_manual(values=ann_colors$study_group) +
+  #scale_color_viridis(discrete=T, end=0.9, direction=-1) +
+  theme_bw() +
+  theme(
+    panel.grid=element_blank(),
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    strip.background = element_blank(),
+    aspect.ratio = 1
+  ) +
+  facet_wrap(~study_day) +
+  labs(
+    color="", shape="",
+    x=paste0("PCoA axis 1 (", pc_pct[1], "%)"),
+    y=paste0("PCoA axis 2 (", pc_pct[2], "%)")
+  )
+ggsave("FigS3_farmm_PS_PCoA_bc.pdf", height=4, width=5, useDingbats=F)
+
+```
+
+PERMANOVA results of Bray-Curtis distances comparing between the study day of each diet group.
+
+
+```{r}
+s_PS %>%
+  group_by(study_group) %>%
+  do(permanova_with_shuffle_1_group_posthoc(bc, ., "study_day", "SubjectID", perm, T, p_cutoff=0.05)) %>%
+  ungroup() %>%
+  select(-Term) %>%
+  mutate(fdr = p.adjust(p.value, method="BH")) %>%
+  pander(split.table=Inf, digits=2, emphasize.strong.rows = which(.$fdr < 0.05))
+```
+
+
+
+# Supplementary Figure 6: Heatmap of controls
+
+```{r}
+s_toPlot <- s %>%
+  filter(isControl) %>%
+  filter(project == "FARMM") %>%
+  mutate(SampleType = ifelse(grepl("VibrioLambda", SampleID), "Positive control", as.character(SampleType))) %>%
+  mutate(SampleType = fct_collapse(SampleType, `Blank swab`=c("Blank Swab", "Bank swab"), `Empty well`=c("Empty well", "Empty well "))) %>%
+  mutate(non_host = log10(non_host))
+props_toPlot <- props[,s_toPlot$SampleID]
+#props_toPlot <- props_toPlot[apply(props_toPlot,1,mean) >= 0.01,s_toPlot$SampleID]
+
+
+props_toPlot <- props_toPlot[which(rowSums(props_toPlot>=0.05) > 1),s_toPlot$SampleID]
+
+rownames(props_toPlot) <- gsub("_", " ", rownames(props_toPlot))
+
+annotations <- s_toPlot %>%
+  arrange(SampleType) %>%
+  select(SampleID, SampleType, non_host)
+rownames(annotations) = annotations$SampleID
+annotations <- select(annotations, -SampleID)
+
+gaps <- annotations %>%
+  group_by(SampleType) %>%
+  summarize(nums = n()) %>%
+  ungroup() %>%
+  pull(nums) %>%
+  cumsum()
+
+pheatmap(props_toPlot[,rownames(annotations)], 
+         annotation = annotations, 
+         annotation_colors = ann_colors,
+         color = saturated_rainbow(101, saturation_limit=0.4), 
+         breaks = c(0, 1e-10, seq(0.001, 1, length.out = 100)),
+         gaps_col = gaps,
+         filename = "FigS6_farmm_heatmap_controls.pdf", 
+         fontsize_col = 8, fontsize_row = 8, 
+         cluster_cols = FALSE, cluster_rows = FALSE,
+         cellheight = 8, cellwidth = 8)
+
+```
+

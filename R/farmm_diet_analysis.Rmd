@@ -1,0 +1,654 @@
+---
+title: "FARMM Diet data summary"
+author: "Ceylan Tanes - PennCHOP Microbiome Program"
+date: \today
+output: 
+  pdf_document:
+    toc: true
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  tidy=FALSE,
+  cache=FALSE,
+  echo=FALSE,
+  warning=FALSE,
+  message=FALSE,
+  dpi=100,
+  fig.width=6,
+  fig.height=4,
+  fig.align = "center"
+  )
+```
+
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(ggbeeswarm)
+library(RColorBrewer)
+library(forcats)
+library(readxl)
+library(broom)
+library(pander)
+library(reshape2)
+
+library(emmeans)
+
+library(vegan)
+library(ape)
+library(usedist)
+```
+
+```{r}
+tidy_lm_posthoc <- function(lm_test, study_group) {
+  form1 <- paste("pairwise ~", study_group)
+  mod <- anova(lm_test)
+  bind_rows(data.frame(contrast = rownames(mod), mod, row.names=NULL) %>%
+              rename(p.value="Pr..F.", df="Df"),
+            data.frame(emmeans(lm_test, list(as.formula(form1)), adjust="tukey")[[2]])
+            ) %>%
+    #mutate(AIC = AIC(lm_test)) %>%
+    select(contrast, p.value, everything())
+}
+
+tidy_permanova <- function(anov){
+  data.frame(Term = rownames(anov$aov.tab), anov$aov.tab, row.names = NULL) %>%
+    rename(p.value = Pr..F.)
+}
+
+permanova_test <- function(dist_matrix, s_toTest, form1, perm, strata=NULL){
+  set.seed(42)
+  if (!grepl("~", form1)) {
+    form1 <- paste0("dist_matrix ~ ", form1)
+  }
+  dist_matrix <- dist_subset(dist_matrix, s_toTest$SampleID)
+  form1 <- as.formula(form1)
+  if(is.null(strata)) {
+    tidy_permanova(adonis(form1, data=s_toTest, permutations=perm))
+  } else {
+    tidy_permanova(adonis(form1, data=s_toTest, permutations=perm, strata=s_toTest[,strata]))
+  }
+}
+
+permanova_posthoc <- function(dist_matrix, s_toTest, form1, perm, strata=NULL, group_label, p_cutoff=0.05){
+  if (!grepl("~", form1)) {
+    form1 <- paste0("dist_matrix ~ ", form1)
+  }
+  a_ixn <- permanova_test(dist_matrix, s_toTest, form1, perm, strata) %>%
+    mutate(comparison = "all")
+  combs <- combn(as.character(unique(s_toTest[[group_label]])), 2)
+  num_tests <- dim(combs)[2]
+  
+  # do post hoc tests
+  if (filter(a_ixn, Term == group_label)$p.value < p_cutoff) {
+    for (i in 1:num_tests){
+      s_temp <- filter(s_toTest, .data[[group_label]] %in% combs[,i])
+      #dist_toTest = dist_subset(dist_matrix, s_temp$SampleID)
+      a_ixn <- rbind(a_ixn,
+        permanova_test(dist_matrix, s_temp, form1, perm, strata) %>%
+          mutate(comparison = paste(combs[,i], collapse=' - '))
+      )
+    }
+  }
+  a_ixn
+}
+
+
+```
+
+```{r}
+ann_colors <- list(
+  Diet = setNames(brewer.pal(5, "Paired")[c(5,1,3)], c("Omnivore", "EEN", "Vegan")),
+  Diet_comb = setNames(c(brewer.pal(5, "Paired")[c(5,1,3)], brewer.pal(3, "Set1")), c("Omnivore\nDHQ", "EEN\nDHQ", "Vegan\nDHQ", "Omnivore\nIntervention", "EEN\nIntervention", "Vegan\nIntervention"))
+)
+
+data_dir <- "../data"
+s_mod_fp <- file.path(data_dir, "modulen_macronutrient.txt")
+diet_all <- read.delim(file.path(data_dir, "DHQ_and_omnivore_diet.txt")) %>%
+  mutate(Diet = factor(Diet)) %>%
+  mutate(Diet = fct_relevel(Diet, "EEN", after=Inf)) %>%
+  mutate(time_point = factor(time_point))
+
+diet_matrix <- as.matrix(diet_all[,6:ncol(diet_all)])
+rownames(diet_matrix) <- diet_all$SubjectID
+
+```
+
+
+
+
+
+# Figure 1B: Macronutrient comparison
+
+```{r}
+se <- function(x) sd(x)/sqrt(length(x))
+
+diet_all_select <- diet_all %>%
+  select(
+    SubjectID, Diet, time_point, BMI, Age,
+    Fats=total.fat.g, Carbohydrates=carbohydrate.g, Proteins=total.protein.g,
+         `Saturates`=total.saturated.fatty.acids.g, 
+         `Monounsaturates`=total.monounsaturated.fatty.acids.g, 
+         `Polyunsaturates`=total.polyunsaturated.fatty.acids.g,
+         `Total dietary fiber`=total.dietary.fiber.g, 
+         `Soluble dietary fiber`=soluble.dietary.fiber.g, 
+         Sugars=total.sugars.g,
+         `Insoluble dietary fiber`=insoluble.dietary.fiber.g
+  ) %>%
+  gather("Nutrient", "value", -one_of("SubjectID", "Diet", "time_point", "BMI", "Age")) %>%
+  droplevels() 
+
+
+
+diet_modulen <- read.delim(s_mod_fp) %>%
+  mutate(energy = filter(., Nutrient == "Energy")$value) %>%
+  filter(Nutrient != "Energy") %>%
+  mutate(value = value / energy * 1000) %>%
+  filter(!Nutrient %in% c("Salt", "lactose", "MCT")) %>%
+  mutate(Diet = "EEN") %>%
+  mutate(time_point = "Intervention")
+
+
+s_all <- bind_rows(diet_all_select, diet_modulen) %>%
+  mutate(group = ifelse(Nutrient %in% c("Carbohydrates", "Fats", "Proteins"), "Macro", NA)) %>%
+  mutate(group = ifelse(Nutrient %in% c("Insoluble dietary fiber", "Soluble dietary fiber", "Total dietary fiber", "Sugars"), "Carbohydrates", group)) %>%
+  mutate(group = ifelse(Nutrient %in% c("Monounsaturates", "Polyunsaturates", "Saturates"), "Fats", group)) %>%
+  mutate(group2 = ifelse(group=="Macro", Nutrient, group)) %>%
+  mutate(Diet = factor(Diet)) %>%
+  mutate(Diet = fct_relevel(Diet, "EEN", after=Inf)) %>%
+  mutate(time_point = factor(time_point))
+
+
+s_summarized <- s_all %>%
+  group_by(Diet, Nutrient, group, group2, time_point) %>%
+  summarize(mean_value = mean(value), se_value = se(value)) %>%
+  rename(value = mean_value) %>%
+  ungroup()
+```
+
+
+Summary of total carbs, fats and proteins.
+
+```{r fig.height=3, fig.width=6}
+s_summarized %>%
+  mutate(Diet_comb=interaction(Diet, time_point, sep='\n')) %>%
+  
+  filter(group == "Macro") %>%
+  ggplot(aes(x=Diet_comb, y=value, fill=Diet_comb)) +
+  geom_bar(stat="identity", position=position_dodge(width=0.8)) +
+  geom_errorbar(aes(ymin=value-se_value, ymax=value+se_value), width=0.25, size=0.5, color="black") + 
+  scale_fill_manual(values=ann_colors$Diet_comb) +
+  scale_color_manual(values=ann_colors$Diet_comb) +
+  theme_bw() +
+  facet_grid(~Nutrient) +
+  scale_y_continuous(expand = c(0, 0), limits=c(0, 150)) +
+  theme(
+    axis.text.x = element_text(angle=90, hjust=1, vjust=0.5),
+    panel.grid = element_blank(),
+    aspect.ratio=1,
+    strip.background = element_blank()
+  ) +
+  guides(fill=F) +
+  labs(
+    x="", fill="",
+    y="Nutrient amount (g)\nper 1000 kcal"
+  )
+ggsave("Fig1B_farmm_macronutrients.pdf", height=3, width=6, useDingbats=F)
+```
+
+
+Linear models on nutrients from DFQ. The values are only from what the subjects were eating for a month before the the start of the study.
+
+```{r}
+s_all %>%
+  filter(time_point == "DHQ") %>%
+  filter(group == "Macro") %>%
+  
+  mutate(Diet = fct_relevel(Diet, "Vegan", after=0)) %>%
+  
+  group_by(Nutrient) %>%
+  do(tidy_lm_posthoc(lm(value ~ BMI + Age + Diet, data=.), "Diet")) %>%
+  ungroup() %>%
+  
+  filter(!grepl("Residuals", contrast)) %>%
+  
+  group_by(contrast) %>%
+  mutate(fdr = p.adjust(p.value, method = "BH")) %>%
+  ungroup() %>%
+  
+  #filter(p.value < 0.05) %>%
+  
+  mutate(estimate = estimate * -1) %>%
+  select(Nutrient, contrast, df, estimate, SE, p.value, fdr) %>%
+  
+  pander(split.table=Inf, digits=2)
+
+
+```
+
+
+
+
+Linear models on nutrients from DFQ. The values are only from what the subjects were eating for a month before the the start of the study.
+
+```{r}
+s_all %>%
+  filter(time_point == "DHQ") %>%
+  
+  mutate(Diet = fct_relevel(Diet, "Vegan", after=0)) %>%
+  
+  group_by(Nutrient) %>%
+  do(tidy_lm_posthoc(lm(value ~ Diet, data=.), "Diet")) %>%
+  ungroup() %>%
+  
+  filter(!grepl("Residuals", contrast)) %>%
+  
+  group_by(contrast) %>%
+  mutate(fdr = p.adjust(p.value, method = "BH")) %>%
+  ungroup() %>%
+  
+  filter(p.value < 0.05) %>%
+  
+  mutate(estimate = estimate * -1) %>%
+  select(Nutrient, contrast, df, estimate, SE, p.value, fdr) %>%
+  
+  pander(split.table=Inf, digits=2)
+
+
+```
+
+
+# Figure 1C: Macronutrient ratios
+
+```{r fig.height=3, fig.width=5}
+s_all_ratios <- s_all %>%
+  filter(Nutrient %in% c("Total dietary fiber", "Sugars", "Monounsaturates", "Polyunsaturates", "Saturates")) %>%
+  select(Diet, Nutrient, time_point, SubjectID, BMI, Age, value) %>%
+  spread(Nutrient, value) %>%
+  mutate(fiber_2_sugar = `Total dietary fiber`/Sugars) %>%
+  mutate(Unsaturates = Polyunsaturates + Saturates) %>%
+  mutate(unsat_2_sat = Unsaturates/Saturates) %>%
+  select(Diet, time_point, SubjectID, BMI, Age, fiber_2_sugar, unsat_2_sat) %>%
+  gather("Nutrient", "ratio", fiber_2_sugar, unsat_2_sat) %>%
+  
+  mutate(Diet_comb = interaction(Diet, time_point, sep='\n')) 
+
+
+
+
+s_all_ratios %>%
+  group_by(Diet_comb, Nutrient) %>%
+  summarize(mean_value = mean(ratio), se_value = se(ratio)) %>%
+  rename(ratio = mean_value) %>%
+  ungroup() %>%
+  
+  mutate(Nutrient = fct_recode(Nutrient, 
+                               `Total Fiber / Sugar`="fiber_2_sugar", 
+                               `Unsaturated / Saturated Fat`="unsat_2_sat")) %>%
+  
+  ggplot(aes(x=Diet_comb, y=ratio, fill=Diet_comb)) +
+    geom_bar(stat="identity", position=position_dodge()) +
+    geom_errorbar(aes(ymin=ratio-se_value, ymax=ratio+se_value), width=0.25, size=0.5, color="black") + 
+    scale_fill_manual(values=ann_colors$Diet_comb) +
+    facet_wrap(. ~ Nutrient, ncol=4, scales="free_x") +
+    theme_bw() +
+    theme(
+      axis.text.x = element_text(angle=90, hjust=1, vjust=0.5),
+      panel.grid = element_blank(),
+      strip.background = element_blank(),
+      aspect.ratio = 1
+    ) +
+    scale_y_continuous(limits=c(0,3.3)) +
+    #scale_y_log10() +
+    guides(fill=F) +
+    labs(
+      x="", fill="",
+      y="Nutrient ratios"
+    )
+ggsave("Fig1C_farmm_nutrient_ratios.pdf", height=3, width=5, useDingbats=F)
+```
+
+
+```{r}
+s_all_ratios %>%
+  filter(time_point == "DHQ") %>%
+  
+  mutate(Diet = fct_relevel(Diet, "Vegan", after=0)) %>%
+  
+  group_by(Nutrient) %>%
+  do(tidy_lm_posthoc(lm(log10(ratio) ~ BMI + Age + Diet, data=.), "Diet")) %>%
+  ungroup() %>%
+  
+  filter(!grepl("Residuals", contrast)) %>%
+  
+  group_by(contrast) %>%
+  mutate(fdr = p.adjust(p.value, method = "BH")) %>%
+  ungroup() %>%
+  
+  #filter(p.value < 0.05) %>%
+  
+  mutate(estimate = estimate * -1) %>%
+  select(Nutrient, contrast, df, estimate, SE, p.value, fdr) %>%
+  
+  pander(split.table=Inf, digits=2)
+
+```
+
+
+Same test but with the 2 omnivore groups merged.
+
+
+```{r}
+s_all_ratios %>%
+  filter(time_point == "DHQ") %>%
+  
+  mutate(Diet = fct_collapse(Diet, "Omnivore_all"=c("Omnivore", "EEN"))) %>%
+  mutate(Diet = fct_relevel(Diet, "Vegan", after=0)) %>%
+  
+  group_by(Nutrient) %>%
+  do(tidy_lm_posthoc(lm(log10(ratio) ~ BMI + Age + Diet, data=.), "Diet")) %>%
+  ungroup() %>%
+  
+  filter(!grepl("Residuals", contrast)) %>%
+  
+  group_by(contrast) %>%
+  mutate(fdr = p.adjust(p.value, method = "BH")) %>%
+  ungroup() %>%
+  
+  #filter(p.value < 0.05) %>%
+  
+  mutate(estimate = estimate * -1) %>%
+  select(Nutrient, contrast, df, estimate, SE, p.value, fdr) %>%
+  
+  pander(split.table=Inf, digits=2)
+
+```
+
+
+# Figure 1D: PCoA
+
+PCA plot for the DHQ of the subjects and the Omnivore diet provided for the subjects during the course of the study.
+
+The data is scaled before doing a PCA analysis.
+
+```{r fig.height=3, fig.width=4}
+pca <- prcomp(diet_matrix, scale=T)
+pc_pct <- round((pca$sdev^2) / sum(pca$sdev^2) * 100)
+diet_all %>%
+  select(SubjectID, Diet, time_point) %>%
+  merge(pca$x[,1:2], by.x="SubjectID", by.y="row.names") %>%
+  
+  mutate(Diet_comb = interaction(Diet, time_point, sep='\n')) %>%
+  
+  ggplot(aes(x=PC1, y=PC2, color=Diet_comb, shape=time_point)) +
+    geom_point() +
+    scale_color_manual(values=ann_colors$Diet_comb) +
+    scale_shape_manual(values=c(16,8)) + 
+    theme_bw() +
+    theme(
+      axis.text=element_blank(),
+      axis.ticks=element_blank(),
+      panel.grid = element_blank(), 
+      aspect.ratio = 1,
+      strip.background = element_blank()
+    ) +
+    labs(
+      color="", shape="",
+      x=paste0("PCA axis 1 (", pc_pct[1], "%)"),
+      y=paste0("PCA axis 2 (", pc_pct[2], "%)")
+    )
+ggsave("Fig1D_farmm_diet_pca.pdf", height=3, width=4, useDingbats=F)
+```
+
+
+
+
+PERMANOVA test on Euclidean distances using DHQ data.
+
+```{r}
+s_toTest <- diet_all %>%
+  select(SampleID=SubjectID, Diet, time_point, BMI, Age) %>%
+  filter(time_point == "DHQ") %>%
+  droplevels()
+
+euc <- vegdist(diet_matrix, method="euclidean")
+#euc <- vegdist(diet_matrix, method="bray")
+
+permanova_posthoc(dist_subset(euc, s_toTest$SampleID), s_toTest, "Diet", 99, strata=NULL, "Diet", p_cutoff=1) %>%
+  select(comparison, Term, Df, R2, p.value) %>%
+  filter(!Term %in% c("Residuals", "Total")) %>%
+  droplevels() %>%
+  pander(split.table=Inf, digits=2)
+
+```
+
+
+PERMANOVA test on Euclidean distances using DHQ data. IN this test the Omnivore and EEN groups are combined.
+
+```{r}
+s_temp <- diet_all %>%
+  select(SampleID=SubjectID, Diet, time_point, BMI, Age) %>%
+  filter(time_point == "DHQ") %>%
+  mutate(Diet = fct_collapse(Diet, Omnivore=c("Omnivore", "EEN"))) %>%
+  droplevels()
+
+euc <- vegdist(diet_matrix, method="euclidean")
+#euc <- vegdist(diet_matrix, method="bray")
+
+permanova_posthoc(dist_subset(euc, s_temp$SampleID), s_temp, "Diet", 99, strata=NULL, "Diet", p_cutoff=1) %>%
+  select(comparison, Term, Df, R2, p.value) %>%
+  filter(!Term %in% c("Residuals", "Total")) %>%
+  droplevels() %>%
+  pander(split.table=Inf, digits=2)
+
+```
+
+Distance between the DHQ data to the engineered omnivore diet
+
+```{r fig.height=3, fig.width=4}
+as.matrix(euc) %>%
+  melt() %>%
+  filter(Var1=="Omnivore") %>%
+  merge(select(diet_all, SubjectID, Diet, time_point), by.x="Var2", by.y="SubjectID") %>%
+  filter(time_point == "DHQ") %>%
+  
+  ggplot(aes(x=Diet, y=value, color=Diet)) +
+    geom_boxplot(outlier.alpha=0) +
+    geom_quasirandom() +
+    scale_color_manual(values=ann_colors$Diet) +
+    theme_bw() +
+    theme(
+      panel.grid = element_blank(),
+      aspect.ratio=1
+    ) +
+    scale_y_continuous(limits=c(0,30000)) +
+    guides(color=F) +
+    labs(
+      x="",
+      y="Euclidean distance to\nengineered omnivore diet"
+    )
+
+ggsave("Fig1D_farmm_distance_to_omnivore_diet.pdf", height=3, width=3, useDingbats=F)
+```
+
+Comparing distance to the omnivore diet.
+
+```{r}
+as.matrix(euc) %>%
+  melt() %>%
+  filter(Var1=="Omnivore") %>%
+  merge(select(diet_all, SubjectID, Diet, time_point), by.x="Var2", by.y="SubjectID") %>%
+  filter(time_point == "DHQ") %>%
+  mutate(Diet = fct_relevel(Diet, "Vegan", after=0)) %>%
+  group_by(time_point) %>%
+  do(tidy_lm_posthoc(lm(value ~ Diet, data=.), "Diet")) %>%
+  ungroup() %>%
+  filter(!grepl("Residuals", contrast)) %>%
+  select(contrast, df, estimate, SE, p.value) %>%
+  pander(split.table=Inf, digits=3)
+```
+
+Same test with the 2 omnivore groups together.
+
+```{r}
+as.matrix(euc) %>%
+  melt() %>%
+  filter(Var1=="Omnivore") %>%
+  merge(select(diet_all, SubjectID, Diet, time_point), by.x="Var2", by.y="SubjectID") %>%
+  filter(time_point == "DHQ") %>%
+  mutate(Diet = fct_collapse(Diet, "omnivore_all"=c("Omnivore", "EEN"))) %>%
+  mutate(Diet = fct_relevel(Diet, "Vegan", after=0)) %>%
+  group_by(time_point) %>%
+  do(tidy_lm_posthoc(lm(value ~ Diet, data=.), "Diet")) %>%
+  ungroup() %>%
+  filter(!grepl("Residuals", contrast)) %>%
+  select(contrast, df, estimate, SE, p.value) %>%
+  pander(split.table=Inf, digits=3)
+
+```
+
+
+
+
+
+
+# Figure S1B: Fiber info
+
+Summary of macronutrients at a finer resolution.
+
+
+
+
+```{r fig.width=6, fig.height=4}
+s_summarized %>%
+  filter(grepl("fiber", Nutrient)) %>%
+  mutate(Nutrient = fct_relabel(Nutrient, function(x) sub(" ", "\n", x))) %>%
+  mutate(Diet_comb = interaction(Diet, time_point, sep='\n')) %>%
+  
+  group_by(Nutrient) %>%
+  mutate(ymax = max(value * 1.4)) %>%
+  ungroup() %>%
+  
+  ggplot(aes(x=Diet_comb, y=value, fill=Diet_comb)) +
+    geom_hline(aes(yintercept=ymax), color="white") +
+    geom_bar(stat="identity", position=position_dodge()) +
+    geom_errorbar(aes(ymin=value-se_value, ymax=value+se_value), width=0.25, size=0.5, color="black") + 
+    scale_fill_manual(values=ann_colors$Diet_comb) +
+    facet_wrap(.~ Nutrient, ncol=4, scales="free_x") +
+    theme_bw() +
+    theme(
+      axis.text.x = element_text(angle=90, hjust=1, vjust=0.5),
+      panel.grid = element_blank(),
+      strip.background = element_blank(),
+      aspect.ratio = 1
+    ) +
+    guides(fill=F) +
+    labs(
+      x="", fill="",
+      y="Nutrient amount (g)\nper 1000 kcal"
+    )
+
+ggsave("FigS1B_farmm_fiber.pdf", height=4, width=6, useDingbats=F)
+```
+
+
+# Figure S1C: Macronutrient higher resolution
+
+
+Linear models on all the nutrients from DFQ. The values are only from what the subjects were eating for a month before the the start of the study.
+
+```{r}
+summaries_df <- diet_all %>%
+  gather("Nutrient", "value", -Diet, -SubjectID, -time_point, -Age, -BMI) %>%
+  
+  filter(time_point == "DHQ") %>%
+  
+  #mutate(Diet = fct_relevel(Diet, "Vegan", after=0)) %>%
+  mutate(Diet = fct_collapse(Diet, `Omnivore_comb`=c("Omnivore", "EEN"))) %>%
+  
+  group_by(Nutrient) %>%
+  #do(tidy_lm_posthoc(lm(value ~ Diet, data=.), "Diet")) %>%
+  do(tidy(lm(value ~ Age + Diet, data=.))) %>%
+  ungroup() %>%
+  
+  filter(!grepl("Intercept", term)) %>%
+  
+  group_by(term) %>%
+  mutate(fdr = p.adjust(p.value, method = "BH")) %>%
+  ungroup() %>%
+  
+  #filter(p.value < 0.05) %>%
+  filter(fdr < 0.05) #%>%
+  
+  #mutate(estimate = estimate * -1) %>%
+  #select(Nutrient, contrast, df, estimate, SE, p.value, fdr) 
+
+
+summaries_df %>%
+  pander(split.table=Inf, digits=2)
+
+
+
+
+```
+
+
+
+
+
+```{r}
+
+results <- summaries_df %>% 
+  filter(fdr < 0.05) %>%
+  filter(grepl("Vegan", term)) %>% 
+  mutate(direction = ifelse(estimate>0, "higher", "lower")) %>% 
+  #mutate(term = sub("Diet", "", term)) %>% 
+  #mutate(significant = "yes") %>% 
+  select(Nutrient, direction)# %>% 
+  #spread(contrast, significant, fill = "no")
+
+diet_all %>%
+  gather("Nutrient", "value", -Diet, -SubjectID, -time_point) %>%
+  filter(Nutrient %in% as.character(results$Nutrient)) %>%
+  
+  left_join(results,  by="Nutrient") %>%
+  
+  group_by(Nutrient) %>%
+  mutate(value_scaled = scale(value)) %>%
+  ungroup() %>%
+  
+  mutate(Nutrient = fct_relabel(Nutrient, function(x) gsub("\\.", " ", x))) %>%
+  mutate(Nutrient = sub(" mg$| g$| mcg$", "", Nutrient)) %>%
+  
+  mutate(time_point = fct_rev(time_point)) %>%
+  mutate(Diet = fct_relevel(Diet, "Vegan", after=Inf)) %>%
+  mutate(toFacet = interaction(Diet, time_point, sep='\n')) %>%
+  
+  
+  ggplot(aes(x=SubjectID, y=Nutrient)) + 
+    geom_tile(aes(fill = value_scaled), colour = "white") + 
+    scale_fill_gradient2(low = brewer.pal(11, 'RdBu')[11], high = brewer.pal(11, 'RdBu')[1], mid=brewer.pal(11, 'RdBu')[6], midpoint=0) +
+    facet_grid(direction ~ toFacet, scales="free", space="free") +
+    theme_bw() +
+    scale_y_discrete(expand = c(0,0)) +
+    theme(
+      axis.text.x = element_blank(),
+      axis.ticks.x = element_blank(),
+      strip.background = element_blank(),
+      strip.text.y = element_text(angle = 0),
+      panel.grid = element_blank(),
+      aspect.ratio = 1
+    ) +
+    labs(
+      x="Subjects",
+      y="", fill="Z-scores"
+    )
+
+
+ggsave("FigS1C_farmm_nutrient_details.pdf", height=5.5, width=7, useDingbats=F)
+```
+
+
