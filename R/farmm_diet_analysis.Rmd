@@ -519,7 +519,37 @@ as.matrix(euc) %>%
 
 Summary of macronutrients at a finer resolution.
 
+```{r}
+summaries_df <- diet_all %>%
+  gather("Nutrient", "value", -Diet, -SubjectID, -time_point, -Age, -BMI) %>%
+  
+  filter(time_point == "DHQ") %>%
+  filter(grepl("fiber", Nutrient)) %>%
+  
+  mutate(Diet = fct_relevel(Diet, "Vegan", after=0)) %>%
+  #mutate(Diet = fct_collapse(Diet, `Omnivore_comb`=c("Omnivore", "EEN"))) %>%
+  
+  group_by(Nutrient) %>%
+  do(tidy_lm_posthoc(lm(value ~ Diet, data=.), "Diet")) %>%
+  #do(tidy(lm(value ~ Age + Diet, data=.))) %>%
+  ungroup() %>%
+  
+  filter(!grepl("Intercept", contrast)) %>%
+  
+  group_by(contrast) %>%
+  mutate(fdr = p.adjust(p.value, method = "BH")) %>%
+  ungroup() %>%
+  
+  filter(fdr < 0.05)
 
+
+summaries_df %>%
+  pander(split.table=Inf, digits=3)
+
+
+
+
+```
 
 
 ```{r fig.width=6, fig.height=4}
@@ -580,11 +610,7 @@ summaries_df <- diet_all %>%
   mutate(fdr = p.adjust(p.value, method = "BH")) %>%
   ungroup() %>%
   
-  #filter(p.value < 0.05) %>%
-  filter(fdr < 0.05) #%>%
-  
-  #mutate(estimate = estimate * -1) %>%
-  #select(Nutrient, contrast, df, estimate, SE, p.value, fdr) 
+  filter(fdr < 0.05)
 
 
 summaries_df %>%

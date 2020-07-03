@@ -97,14 +97,13 @@ Please see the attached figure GH_enzymes.pdf, farmm_heatmap_GH_unclustered.pdf 
 
 ```{r eval=T}
 library(stringr)
-#read_ko_table <- function (filepath, sample_prefix="PCMP_") {
-#  ko <- as.matrix(read.delim(filepath, row.names=1))
-#  colnames(ko) <- sub(sample_prefix, "", colnames(ko), fixed = TRUE)
-#  ko
-#}
-
-ko <- read.delim(ko_fp)
-
+read_ko_table <- function (filepath, sample_prefix="PCMP_") {
+  ko <- as.matrix(read.delim(filepath, row.names=1))
+  colnames(ko) <- sub(sample_prefix, "", colnames(ko), fixed = TRUE)
+  ko
+}
+ko <- read_ko_table(ko_fp)
+ 
 ko_props <- sweep(ko, 2, colSums(ko), "/")
 
 
@@ -262,6 +261,75 @@ pheatmap(props_toPlot[,rownames(annotations)],
          cluster_cols = FALSE, cluster_rows = FALSE,
          cellheight = 8, cellwidth = 8)
 ```
+
+
+```{r}
+form1 <- "props_logit ~ BMI + Age + study_group * study_day"
+sulfatase_enzymes <- rownames(ko)[grepl("EC:3\\.1\\.6\\.", rownames(ko))]
+sulfatase_enzymes_parsed <- as.data.frame(str_match(sulfatase_enzymes, '^(K\\d{5}) (.*)? \\[(.*)?\\]$')) %>%
+  setNames(c("full_name", "KO", "gene_name", "EC"))
+ko_props_sufatase <- ko_props[sulfatase_enzymes,] %>%
+  melt() %>%
+  setNames(c("gene", "SampleID", "Proportion")) %>%
+  merge(s_toTest, by="SampleID")
+  
+
+summaries_df <- ko_props_sufatase %>%
+  mutate(Proportion = Proportion + 1e-8) %>%
+  mutate(props_logit = log(Proportion/(1-Proportion))) %>%
+  group_by(gene, current_antibiotics) %>%
+  do(tidy_lmer(nlme::lme(as.formula(form1), random = ~ 1 | SubjectID, data=., na.action=na.omit))) %>%
+  ungroup() %>%
+  filter(term != '(Intercept)') %>%
+  #group_by(term) %>%
+  mutate(fdr = p.adjust(p.value, method="BH")) %>%
+  #ungroup() %>%
+  filter(p.value<0.05) %>%
+  mutate(term = sub("study_group", "Omnivore - ", term))
+
+summaries_df %>%
+  filter(fdr < 0.05) %>%
+  pander(split.table=Inf, digits=2)
+```
+
+```{r}
+genes_of_interest <- summaries_df %>%
+  filter(term == "Omnivore - EEN:study_day") %>%
+  filter(current_antibiotics != "Antibiotics Treatment") %>%
+  filter(fdr < 0.05) %>%
+  pull(gene) %>%
+  as.character()
+
+ko_props_sufatase %>%
+  filter(gene %in% genes_of_interest) %>%
+  group_by(study_group, study_day, gene) %>%
+  summarize(mean_ab = mean(Proportion), se_ab = se(Proportion)) %>%
+  ungroup() %>%
+  mutate(gene = sub("^K\\d{5} ", "", gene)) %>%
+  mutate(gene = gsub("\\[", "\n\\[", gene)) %>%
+  mutate(gene = reorder(gene, -mean_ab)) %>%
+  ggplot(aes(x=study_day, y=mean_ab, group=study_group, color=study_group, fill=study_group)) +
+    geom_rect(fill="gray90", color="gray90", alpha=0.5, xmin=6, xmax=8, ymin=-Inf, ymax=Inf) +
+    geom_point() +
+    geom_line() +
+    theme_bw() +
+    theme(
+      strip.background = element_blank(),
+      panel.grid = element_blank(),
+      aspect.ratio = 1) +
+    scale_y_continuous(labels=scales:::percent) +
+    scale_x_continuous(breaks=c(0,3,6,9,12,15)) +
+    geom_ribbon(aes(ymax = mean_ab + se_ab, ymin = mean_ab - se_ab), alpha=0.2) +
+    scale_color_manual(values=ann_colors$study_group) +
+    scale_fill_manual(values=ann_colors$study_group) +
+    facet_wrap(~ gene, scale="free", ncol=3) +
+    labs(x="Study day", color="", fill="",
+         y="Relative abundance of\nsulfatase genes")
+
+ggsave("Figxx_sulfatase_genes.pdf", height=3, width=10)
+```
+
+
 
 
 

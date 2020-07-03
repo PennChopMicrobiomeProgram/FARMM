@@ -68,6 +68,17 @@ s_toTest %>%
 ggsave("Fig1A_farmm_quality.pdf", height=2, width=7, useDingbats=F)
 ```
 
+```{r}
+s_toTest %>%
+  mutate(perc_host = host / both_kept) %>%
+  mutate(perc_nonhost = non_host / both_kept) %>%
+  group_by(current_antibiotics) %>%
+  do(tidy_lmer(nlme::lme(log(perc_host) ~ study_group, random=~1|SubjectID, data=., na.action=na.omit))) %>%
+  ungroup() %>%
+  filter(!grepl("Intercept", term)) %>%
+  pander(split.table=Inf, digits=2)
+
+```
 
 
 
